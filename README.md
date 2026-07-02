@@ -1,62 +1,80 @@
-# autoprot
+# epiLoRA
 
-Autonomous protein language model research, inspired by
-[autoresearch](https://github.com/karpathy/autoresearch).
+Per-residue **B-cell epitope prediction** on antigen structures with the
+best-performing model from the epiLoRA study: **ESM-IF1 + LoRA + RYS**.
 
-An AI coding agent (Claude Code, Codex, etc.) iteratively modifies `train.py`
-to minimize validation loss on a protein masked language model, running
-experiments in a tight loop with git-based version control.
+- **5-fold ROC-AUC: 0.824 ± 0.064** (pooled 0.833) — ahead of an ESM3 LoRA
+  model (~0.71), ESM2 (~0.67), and a DiscoTope-style XGBoost recipe (~0.75).
 
-## How it works
+ESM-IF1 is an inverse-folding model, so it reads protein **backbone geometry**:
+the frozen ESM-IF1 GVP-Transformer encoder is adapted with **LoRA** on its
+attention projections, its top encoder layers are replayed once (**RYS** =
+"Repeat Yourself"), and a small linear head scores each residue. Inputs are a
+**PDB structure + chain**, not a bare sequence.
 
-1. Point an autonomous coding agent at `program.md`
-2. The agent modifies `train.py`, commits, runs the experiment, and evaluates
-3. Improvements are kept; failures are reverted via `git reset`
-4. Results are logged to `results.tsv`
-5. The loop runs until you stop it
+## Layout
 
-## Files
-
-| File | Purpose |
-|------|---------|
-| `prepare.py` | **IMMUTABLE** — tokenizer, data loading, masking, evaluation |
-| `train.py` | **MUTABLE** — model architecture, optimizer, training loop |
-| `program.md` | Agent instructions and research objectives |
-
-## Quick start
-
-```bash
-# Put FASTA files in data/train/ and data/val/
-cp /path/to/train_sequences.fasta data/train/
-cp /path/to/val_sequences.fasta data/val/
-
-# Supports .fasta, .fa, .fasta.gz, and .fa.gz files
-
-# Start the agent with program.md as context
-# (e.g., in Claude Code, just point it to program.md)
+```
+model.py            ESM-IF1 + LoRA + RYS + head (the model)
+data.py             training-data loading (labelled FASTA + PDB structures)
+train.py            train the model, save a checkpoint
+predict.py          run a trained checkpoint on a PDB -> per-residue scores
+requirements.txt    pinned dependencies (Python 3.9)
+weights/            trained checkpoints go here (not committed) — see weights/README.md
+data/               your training data goes here (not committed) — see data/README.md
 ```
 
-## Manual run
+## Install
+
+Requires **Python 3.9** and the fair-esm inverse-folding stack (torch-geometric
+et al.). ESM-IF1's frozen backbone (~140 MB) downloads automatically on first
+use.
 
 ```bash
-uv run train.py
+python -m venv env && source env/bin/activate
+pip install torch==2.8.0
+pip install torch-geometric torch-scatter torch-sparse torch-cluster \
+    -f https://data.pyg.org/whl/torch-2.8.0+cu128.html   # match your torch/CUDA
+pip install -r requirements.txt
 ```
 
-## B-cell epitope prediction (ESM3 + LoRA + RYS)
+A GPU is recommended for training; prediction runs fine on CPU.
 
-The main line of work is per-residue B-cell epitope prediction on antigen
-sequences: **ESM3-small-open** (frozen) + **LoRA** + optional **RYS** block
-replay + a linear head (`train_struct.py`). Experiments run as 3-fold CV on
-`data/BEPIPRED.fasta` and log to `results.tsv`.
+## Weights
+
+Trained checkpoints are **not committed**. Put one at `weights/epilora_if1.pt`
+(the default path for both scripts):
+
+- **download** the released checkpoint into `weights/`, **or**
+- **train your own** (below).
+
+See [`weights/README.md`](weights/README.md) for the checkpoint format.
+
+## Predict
 
 ```bash
-uv run python run_bepipred.py --list        # list experiment sets
-uv run python run_bepipred.py baseline       # run one set
-uv run python run_bepipred.py hiddenkey      # DropKey / HiddenCut / KL sweep
+python predict.py --pdb antigen.pdb --chain A
+# writes a CSV too:
+python predict.py --pdb antigen.pdb --chain A --out scores.csv
 ```
 
-Other runners: `run_ensemble.py {esm3,esm2}` and `run_ensemble_esmif1.py`
-(ensemble members), `run_if1_5fold.py {lora,xgb}` (5-fold IF1 comparison),
-`run_bepipred_discotope*.py` (XGBoost-on-embeddings), `run_bepipred_esmc.py`
-(ESMC backbone). Data-processing scripts live in `data/`. See `CLAUDE.md` for
-the full layout.
+Output is one row per residue: position, amino acid, epitope probability, and a
+binary call at `--threshold` (default 0.5). If `--chain` is omitted the first
+chain is used.
+
+## Train
+
+Put your labelled data under `data/` (format in [`data/README.md`](data/README.md)),
+then:
+
+```bash
+python train.py \
+    --fasta data/BEPIPRED.fasta \
+    --structures data/structures2/sabdab_dataset \
+    --out weights/epilora_if1.pt
+```
+
+Trains on every non-`EVAL` partition, holds out one partition (`--val`, default
+`5`) for early stopping, and saves the trainable weights (LoRA adapters + head,
+~0.5 MB) plus config to `--out`. The frozen ESM-IF1 backbone is not stored — it
+is re-downloaded on load.
