@@ -20,12 +20,15 @@ block-replay + trainable linear head. See `train_struct.py`.
 train_struct.py           main model + training loop (ESM3 + LoRA + RYS + head)
 prepare.py                IMMUTABLE — tokenizer, FASTA loaders, PU loss
 features.py               RSA / biophysical / BLOSUM extra features
-run_bepipred_*.py         experiment runners; each script = one batch of
-                          experiments; append rows to results.tsv
-
+run_bepipred.py           config-driven ESM3 CV runner; picks a named
+                          experiment set (baseline/rsa/dropout/hiddenkey/...)
+run_bepipred_discotope*.py  DiscoTope-style XGBoost-on-embeddings runners
+run_bepipred_esmc.py      ESMC-600M backbone variant
+run_ensemble.py           ESM3/ESM2 ensemble members -> ensemble_preds/*.npz
+run_ensemble_esmif1.py    ESM-IF1 ensemble member + IF1 library (py3.9 env)
+run_if1_5fold.py          5-fold IF1 comparison: LoRA+RYS vs XGBoost
 data/                     BEPIPRED.fasta, pdb_contacts.fasta, structures/, etc.
-scripts/legacy/           old DiscoTope / Surf2Spot / ensemble research scripts
-                          (kept for reference; not in active pipeline)
+                          (+ the data-processing scripts; no data committed)
 archive/                  stale logs, old results backups, large artifacts
 docs/                     paper PDFs referenced from experiments
 findings/                 markdown writeups of experiment findings
@@ -37,12 +40,20 @@ results.tsv               append-only experiment log (do not commit)
 ## Run an experiment
 
 ```bash
-uv run python run_bepipred_<name>.py > /tmp/run_<name>.log 2>&1
+uv run python run_bepipred.py <set> > /tmp/run_<set>.log 2>&1
+uv run python run_bepipred.py --list        # show all experiment sets
 ```
 
-Each fold burns ~7 min on this box; one experiment × 3 folds is ~22 min. Use
-the existing fold + skip-if-already-logged pattern in `run_bepipred_dropout.py`
-or `run_bepipred_lora_all_active.py` as the template.
+`<set>` is one of: `baseline`, `rsa`, `features`, `dropout`, `hiddenkey`,
+`hky_pscan`, `hkx`, `lora_all_active`, `lora_scale`, `lora_select`,
+`probe_ldrop`, `pretrain`, `ultra` (or `all`). Each set is a list of
+`(name, desc, cfg)` entries defined in a `_set_<name>()` function near the top
+of `run_bepipred.py`; add a new experiment batch by adding one such function
+and registering it in the `SETS` dict.
+
+Each fold burns ~7 min on this box; one experiment × 3 folds is ~22 min. The
+runner appends per fold/run to `results.tsv` and skips any (exp, fold, run)
+already logged, so a crashed run resumes cleanly.
 
 ## CV folds (do not change)
 
@@ -82,15 +93,15 @@ or VRAM grows ~10 GB/run and OOMs after a few experiments on a 48 GB card.
 
 ## Conventions
 
-- One experiment batch = one `run_bepipred_<name>.py` script, committed to
-  git before running.
+- One experiment batch = one `_set_<name>()` function in `run_bepipred.py`,
+  registered in `SETS`. Commit it before running.
 - Append to `results.tsv` per fold per run; the skip-if-already-logged
   pattern lets you resume after a crash without re-running completed folds.
 - Don't commit `results.tsv`, `.log` files, or anything under `archive/`.
 - Don't edit `prepare.py`.
-- Don't add features / refactors that aren't needed for the current
-  experiment. Three repeated lines in a runner is fine; abstracting them is
-  not unless it pays for itself across multiple runners.
+- Keep the runner config-driven: a new experiment should be a new entry in a
+  `_set_*` list, not a new script. Genuinely different pipelines (XGBoost,
+  a different backbone, a different env) still warrant their own file.
 
 ## Paper-driven experiments
 
@@ -98,13 +109,11 @@ ACL 2024 Findings: *LoRA Meets Dropout under a Unified Framework* (Wang et
 al.) — `docs/lora_dropout_hiddenkey_acl2024.pdf`. Recommends **HiddenKey** =
 column-wise DropKey on attention logits + element-wise HiddenCut on FFN
 hidden representations + bidirectional KL loss between two forward passes
-(R-drop). Implementations live in `train_struct.py`; runners in
-`run_bepipred_hiddenkey.py`.
+(R-drop). Implementations live in `train_struct.py`; run with
+`run_bepipred.py hiddenkey` (also `hky_pscan`, `hkx`).
 
 ## Today's working state
 
-Active branch: `autoprot/mar25`. Recent focus: structure / layer / head
-dropout sweep (`run_bepipred_dropout.py`), then full-coverage LoRA + active
-LayerDrop (`run_bepipred_lora_all_active.py`). Best test_auc to date:
-`layerdrop-active-2-30` at ~0.735 across 3 folds. Baseline (no RYS, LoRA
-rank=4, last-8): ~0.708.
+Best test_auc to date: `layerdrop-active-2-30` (`run_bepipred.py dropout`) at
+~0.735 across 3 folds. Baseline (no RYS, LoRA rank=4, last-8): ~0.708. The
+ESM-IF1 LoRA+RYS member reaches ~0.82 (`run_if1_5fold.py lora`).
