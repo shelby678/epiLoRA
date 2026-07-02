@@ -41,3 +41,22 @@ cp /path/to/val_sequences.fasta data/val/
 ```bash
 uv run train.py
 ```
+
+## B-cell epitope prediction (ESM3 + LoRA + RYS)
+
+The main line of work is per-residue B-cell epitope prediction on antigen
+sequences: **ESM3-small-open** (frozen) + **LoRA** + optional **RYS** block
+replay + a linear head (`train_struct.py`). Experiments run as 3-fold CV on
+`data/BEPIPRED.fasta` and log to `results.tsv`.
+
+```bash
+uv run python run_bepipred.py --list        # list experiment sets
+uv run python run_bepipred.py baseline       # run one set
+uv run python run_bepipred.py hiddenkey      # DropKey / HiddenCut / KL sweep
+```
+
+Other runners: `run_ensemble.py {esm3,esm2}` and `run_ensemble_esmif1.py`
+(ensemble members), `run_if1_5fold.py {lora,xgb}` (5-fold IF1 comparison),
+`run_bepipred_discotope*.py` (XGBoost-on-embeddings), `run_bepipred_esmc.py`
+(ESMC backbone). Data-processing scripts live in `data/`. See `CLAUDE.md` for
+the full layout.
