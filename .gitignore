@@ -217,19 +217,16 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# --- epiLoRA: never commit data or experiment artifacts ---
-# Experiment logs / append-only results
-results.tsv
-run.log
-*.log
-archive/
+# --- epiLoRA: never commit weights or data ---
+# Trained checkpoints (keep only the explanatory README)
+weights/*
+!weights/README.md
 
-# Ignore ALL data files; keep only the data-processing scripts
+# Training data / structures (user-supplied)
 data/*
-!data/*.py
-!data/*.sh
+!data/README.md
 
-# Model weights / caches / embeddings
+# Model weights / caches / arrays / logs
 *.pt
 *.pth
 *.ckpt
@@ -238,3 +235,4 @@ data/*
 *.npz
 *.h5
 *.zip
+*.log

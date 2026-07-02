@@ -1,0 +1,20 @@
+# epiLoRA (ESM-IF1 + LoRA + RYS). Tested on Python 3.9.
+#
+# ESM-IF1 is an inverse-folding model, so it needs fair-esm's structure stack
+# (torch-geometric + scatter/sparse/cluster). Install torch first, then match
+# the geometric wheels to your torch/CUDA build, e.g.:
+#   pip install torch==2.8.0
+#   pip install torch-geometric torch-scatter torch-sparse torch-cluster \
+#       -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+#
+# Versions below are the ones this was validated against.
+fair-esm==0.5.0
+torch==2.8.0
+torch-geometric==2.1.0.post1
+torch-scatter==2.1.2
+torch-sparse==0.6.18
+torch-cluster==1.6.3
+biotite==0.40.0
+biopython==1.80
+scikit-learn==1.6.1
+numpy==1.26.4
