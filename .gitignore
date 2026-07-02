@@ -216,3 +216,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- epiLoRA: never commit data or experiment artifacts ---
+# Experiment logs / append-only results
+results.tsv
+run.log
+*.log
+archive/
+
+# Ignore ALL data files; keep only the data-processing scripts
+data/*
+!data/*.py
+!data/*.sh
+
+# Model weights / caches / embeddings
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.h5
+*.zip
