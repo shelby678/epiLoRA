@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import time
 from pathlib import Path
 
@@ -38,7 +39,7 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-4
 WARMUP_STEPS = 200
 VAL_INTERVAL = 200
-PATIENCE = 5
+PATIENCE = 10
 
 
 @torch.no_grad()
@@ -60,7 +61,16 @@ def evaluate_auc(model, samples) -> float:
     return float(roc_auc_score(y, s)) if len(np.unique(y)) >= 2 else float("nan")
 
 
-def train(model, train_samples, val_samples, max_seconds: int) -> dict:
+def set_seed(seed: int) -> None:
+    """Seed Python/NumPy/torch RNGs (LoRA + head init draw from the global torch RNG)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42) -> dict:
     """Train in-place with early stopping on val ROC-AUC; keep the best weights."""
     trainable = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"Trainable params: {sum(p.numel() for p in trainable):,}")
@@ -68,7 +78,7 @@ def train(model, train_samples, val_samples, max_seconds: int) -> dict:
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / max(1, WARMUP_STEPS)))
 
     best_auc, best_state, no_improve, step, tl = -1.0, None, 0, 0, 0.0
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     idxs = list(range(len(train_samples)))
     start = time.time()
     model.train()
@@ -121,7 +131,12 @@ def main() -> None:
     p.add_argument("--out", type=Path, default=Path("weights/epilora_if1.pt"))
     p.add_argument("--val", default="5", help="partition held out for early stopping")
     p.add_argument("--max-seconds", type=int, default=1200)
+    p.add_argument("--seed", type=int, default=42,
+                   help="seed for dataset shuffling and LoRA/head weight init")
     args = p.parse_args()
+
+    set_seed(args.seed)
+    logger.info(f"Seed: {args.seed}")
 
     by_part = parse_fasta(args.fasta)
     if args.val not in by_part:
@@ -142,7 +157,7 @@ def main() -> None:
     model = build_model(device=DEVICE, rank=LORA_RANK, alpha=LORA_ALPHA,
                         n_lora_layers=LORA_LAYERS, rys_start=RYS_START, rys_end=RYS_END)
     t0 = time.time()
-    res = train(model, train_samples, val_samples, args.max_seconds)
+    res = train(model, train_samples, val_samples, args.max_seconds, seed=args.seed)
     logger.info(f"Done: best val_auc={res['best_auc']:.4f} steps={res['steps']} {time.time()-t0:.0f}s")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
