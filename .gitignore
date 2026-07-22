@@ -1,5 +1,10 @@
 ./benchmarking/
 data/*/structures/
+claude.md
+data/test*
+data/raw/sabdab_summary_all.csv
+data/raw/all-structures-extracted/
+data/.snakemake/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
