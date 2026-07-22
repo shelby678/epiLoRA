@@ -5,6 +5,7 @@ data/test*
 data/raw/sabdab_summary_all.csv
 data/raw/all-structures-extracted/
 data/.snakemake/
+data/results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
