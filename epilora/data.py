@@ -9,8 +9,8 @@ FASTA format (one record per antigen chain)::
 
   * header fields (space-separated): ``<id>_<chain>``, ``<pdb_id>``,
     ``<chain>``, ``<partition>``  (extra fields are ignored)
-  * sequence casing encodes the label: UPPERCASE = epitope residue,
-    lowercase = non-epitope. The partition ``EVAL`` is always held out.
+  * sequence casing encodes the label: lowercase = epitope residue,
+    UPPERCASE = non-epitope. The partition ``EVAL`` is always held out.
 
 Structures live at ``<structures_dir>/<pdb_id>/structure/<pdb_id>.pdb`` and only
 sequences whose structure is found (and whose residue count matches the
@@ -36,7 +36,7 @@ def parse_fasta(path: Path) -> dict[str, list]:
         part = fields[2] if len(fields) >= 3 else "?"
         if part == "EVAL":
             return
-        labels = [1 if c.isupper() else 0 for c in seq]
+        labels = [1 if c.islower() else 0 for c in seq]
         by_part.setdefault(part, []).append((header, seq.upper(), labels))
 
     header, seq = None, []
