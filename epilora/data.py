@@ -1,20 +1,28 @@
 """Data loading for epiLoRA training.
 
-Training data is a FASTA of antigen sequences plus their PDB structures.
+Training data is a FASTA of antigen sequences (as produced by
+``data/data_prep.smk``) plus their mmCIF structures.
 
-FASTA format (one record per antigen chain)::
+FASTA format (one record per antigen, one or more chains)::
 
-    >4qci_A 4qci A 1
+    >pdb_000010bt-A-E 2026/01/10 1.99 I|J homo_sapiens homo_sapiens n=3 4.0
     ...ndklKRELtnkgqvADIYWL...
 
-  * header fields (space-separated): ``<id>_<chain>``, ``<pdb_id>``,
-    ``<chain>``, ``<partition>``  (extra fields are ignored)
+  * header fields (space-separated): ``instance``, ``date``, ``resolution``,
+    ``antigen_chain`` (``|``-joined if the antigen spans multiple chains),
+    ``heavy_species``, ``light_species``, ``n=<qualifying members>``,
+    ``fold_label``.
+  * ``instance`` starts with the PDB id (``pdb_XXXXXXXX``); the structure
+    lives at ``<structures_dir>/<pdb_id>/<pdb_id>_sabdab.cif``.
   * sequence casing encodes the label: lowercase = epitope residue,
-    UPPERCASE = non-epitope. The partition ``EVAL`` is always held out.
+    UPPERCASE = non-epitope.
+  * ``fold_label`` is ``{i}.{j}`` from the 5-fold CV scheme: ``i`` (1-5) is
+    the cross-validation fold, ``j`` is that fold's role (``0`` = val/eval,
+    ``1`` = test). See ``data/README.md``.
 
-Structures live at ``<structures_dir>/<pdb_id>/structure/<pdb_id>.pdb`` and only
-sequences whose structure is found (and whose residue count matches the
-sequence) are usable — ESM-IF1 needs backbone coordinates.
+Only sequences whose structure is found (and whose residue count matches the
+sequence, chains concatenated in the header's order) are usable — ESM-IF1
+needs backbone coordinates.
 """
 
 from __future__ import annotations
@@ -28,16 +36,13 @@ Sample = tuple
 
 
 def parse_fasta(path: Path) -> dict[str, list]:
-    """Parse the labelled FASTA into {partition: [(header, seq, labels), ...]}."""
+    """Parse the labelled FASTA into {fold_label: [(header, seq, labels), ...]}."""
     by_part: dict[str, list] = {}
 
     def add(header: str, seq: str) -> None:
-        fields = header.split()
-        part = fields[2] if len(fields) >= 3 else "?"
-        if part == "EVAL":
-            return
+        fold_label = header.split()[-1]
         labels = [1 if c.islower() else 0 for c in seq]
-        by_part.setdefault(part, []).append((header, seq.upper(), labels))
+        by_part.setdefault(fold_label, []).append((header, seq.upper(), labels))
 
     header, seq = None, []
     for line in Path(path).read_text().splitlines():
@@ -53,33 +58,41 @@ def parse_fasta(path: Path) -> dict[str, list]:
 
 
 def parse_seq_id(header: str):
-    """Return (pdb_id, chain) from a header, or None if it can't be parsed."""
+    """Return (pdb_id, [chain, ...]) from a header, or None if it can't be parsed."""
     fields = header.split()
-    if len(fields) >= 2:
-        return fields[0].split("_")[0].lower(), fields[1]
-    return None
+    if len(fields) < 4:
+        return None
+    instance = fields[0]
+    if not instance.startswith("pdb_"):
+        return None
+    pdb_id = instance[:len("pdb_") + 8]  # "pdb_" + 8-char PDB code
+    chains = fields[3].split("|")
+    return pdb_id, chains
 
 
-def load_backbone_coords(pdb_path: Path, chain_id: str, seq_len: int):
-    """Load (seq_len, 3, 3) N/CA/C coords for ``chain_id``; None on mismatch."""
-    import biotite.structure as struc
-    import biotite.structure.io.pdb as pdb_io
+def load_backbone_coords(cif_path: Path, chain_ids: list[str], seq_len: int):
+    """Load (seq_len, 3, 3) N/CA/C coords for ``chain_ids`` (concatenated in
+    order); None on mismatch."""
+    from Bio.PDB import MMCIFParser
+    from Bio.PDB.Polypeptide import is_aa
     try:
-        f = pdb_io.PDBFile.read(str(pdb_path))
-        st = pdb_io.get_structure(f, model=1)
+        model = next(iter(MMCIFParser(QUIET=True).get_structure("x", str(cif_path))))
     except Exception:
         return None
-    st = st[(st.chain_id == chain_id) & struc.filter_amino_acids(st)]
-    res_ids = struc.get_residues(st)[0]
-    if len(res_ids) != seq_len:
+
+    residues = []
+    for chain_id in chain_ids:
+        if chain_id not in model:
+            return None
+        residues.extend(res for res in model[chain_id] if is_aa(res, standard=True))
+    if len(residues) != seq_len:
         return None
+
     coords = np.full((seq_len, 3, 3), np.nan, dtype=np.float32)
-    for ri, rid in enumerate(res_ids):
-        ra = st[st.res_id == rid]
+    for ri, res in enumerate(residues):
         for ai, an in enumerate(["N", "CA", "C"]):
-            m = ra.atom_name == an
-            if m.any():
-                coords[ri, ai] = ra.coord[m][0]
+            if an in res:
+                coords[ri, ai] = res[an].coord
     return coords
 
 
@@ -91,9 +104,9 @@ def load_samples(entries: list, structures_dir: Path) -> list:
         parsed = parse_seq_id(header)
         coords = None
         if parsed:
-            pdb_id, chain = parsed
-            pp = structures_dir / pdb_id / "structure" / f"{pdb_id}.pdb"
-            if pp.exists():
-                coords = load_backbone_coords(pp, chain, len(seq))
+            pdb_id, chains = parsed
+            cp = structures_dir / pdb_id / f"{pdb_id}_sabdab.cif"
+            if cp.exists():
+                coords = load_backbone_coords(cp, chains, len(seq))
         out.append((header, seq, labels, coords))
     return out

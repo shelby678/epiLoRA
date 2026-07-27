@@ -16,6 +16,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# fair-esm's esm.inverse_folding.util imports biotite.structure.filter_backbone,
+# which newer biotite (>=1.0) renamed to filter_peptide_backbone.
+import biotite.structure as _struc
+if not hasattr(_struc, "filter_backbone"):
+    _struc.filter_backbone = _struc.filter_peptide_backbone
+
 # Champion hyperparameters (see README / findings).
 LORA_RANK = 4
 LORA_ALPHA = 8.0

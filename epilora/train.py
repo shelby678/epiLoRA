@@ -1,14 +1,24 @@
 """Train the epiLoRA model (ESM-IF1 + LoRA + RYS) and save a checkpoint.
 
     python train.py \
-        --fasta data/BEPIPRED.fasta \
-        --structures data/structures2/sabdab_dataset \
-        --out weights/epilora_if1.pt
+        --fasta data/train_test_eval/all_epitopes.fasta \
+        --structures data/raw/all-structures-extracted \
+        --fold 1 \
+        --out weights/all_epitopes_fold1.pt
 
-Trains on every non-EVAL partition, holding out one partition (``--val``) for
-early stopping, then writes the trainable weights + config to ``--out``. Only
-the LoRA adapters, the RYS-replayed encoder layers, and the head are saved
-(~a few MB); the frozen ESM-IF1 backbone is re-downloaded at load time.
+``--fasta`` is one of the ablation FASTAs from ``data/data_prep.smk``
+(``data/train_test_eval/*_epitopes.fasta``). Each record carries a 5-fold CV
+label ``i.j`` (see ``data/README.md``); ``--fold i`` trains on every record
+whose fold != i.
+
+Early stopping and test-set reporting are evaluated against a *fixed* shared
+benchmark (``--eval-fastas``, default the homo-sapiens and
+homo-sapiens+mus-musculus ablations) rather than ``--fasta``'s own fold-i
+split, so every ablation's model is judged on the same held-out set — the
+first ``--eval-fastas`` entry's ``i.0`` records are used for early stopping;
+every entry's ``i.1`` records are reported as test AUC. Only the LoRA
+adapters, the RYS-replayed encoder layers, and the head are saved (~a few
+MB); the frozen ESM-IF1 backbone is re-downloaded at load time.
 
 Must run in the fair-esm (py3.9) environment — see README / requirements.txt.
 """
@@ -16,6 +26,7 @@ Must run in the fair-esm (py3.9) environment — see README / requirements.txt.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import random
 import time
@@ -34,6 +45,7 @@ from model import (LORA_ALPHA, LORA_LAYERS, LORA_RANK, RYS_END, RYS_START,
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+REPO_ROOT = Path(__file__).resolve().parent.parent  # so defaults don't depend on cwd
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -123,14 +135,26 @@ def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42) -
     return {"steps": step, "val_auc": evaluate_auc(model, val_samples), "best_auc": best_auc}
 
 
+def eval_name(path: Path) -> str:
+    """Short label for an eval FASTA, e.g. allowed_species_homo_sapiens_epitopes.fasta -> homo_sapiens."""
+    return path.stem.removeprefix("allowed_species_").removesuffix("_epitopes")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fasta", type=Path, default=Path("data/BEPIPRED.fasta"))
-    p.add_argument("--structures", type=Path, default=Path("data/structures2/sabdab_dataset"))
-    p.add_argument("--out", type=Path, default=Path("weights/epilora_if1.pt"))
-    p.add_argument("--val", default="5", help="partition held out for early stopping")
-    p.add_argument("--max-seconds", type=int, default=1200)
+    p.add_argument("--fasta", type=Path, default=REPO_ROOT / "data/train_test_eval/all_epitopes.fasta",
+                   help="ablation FASTA to train on")
+    p.add_argument("--structures", type=Path, default=REPO_ROOT / "data/raw/all-structures-extracted")
+    p.add_argument("--out", type=Path, default=REPO_ROOT / "weights/epilora_if1.pt")
+    p.add_argument("--fold", type=int, default=1, choices=[1, 2, 3, 4, 5],
+                   help="held-out CV fold (trains on every other fold)")
+    p.add_argument("--eval-fastas", type=Path, nargs="+", default=[
+        REPO_ROOT / "data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta",
+        REPO_ROOT / "data/train_test_eval/allowed_species_homo_sapiens_mus_musculus_epitopes.fasta",
+    ], help="fixed shared benchmark(s); fold i.0 of the first is used for early "
+             "stopping, fold i.1 of every one is reported as test AUC")
+    p.add_argument("--max-seconds", type=int, default=3600)
     p.add_argument("--seed", type=int, default=42,
                    help="seed for dataset shuffling and LoRA/head weight init")
     args = p.parse_args()
@@ -138,18 +162,22 @@ def main() -> None:
     set_seed(args.seed)
     logger.info(f"Seed: {args.seed}")
 
+    val_label, test_label = f"{args.fold}.0", f"{args.fold}.1"
+
     by_part = parse_fasta(args.fasta)
-    if args.val not in by_part:
-        p.error(f"val partition '{args.val}' not found; available: {sorted(by_part)}")
+    train_entries = [e for k, v in by_part.items() if int(k.split(".")[0]) != args.fold for e in v]
+
+    eval_by_fasta = {ef: parse_fasta(ef) for ef in args.eval_fastas}
+    val_entries = eval_by_fasta[args.eval_fastas[0]].get(val_label, [])
+    if not val_entries:
+        p.error(f"no '{val_label}' records in {args.eval_fastas[0]}")
 
     logger.info(f"Loading structures ({DEVICE}) ...")
-    train_entries = [e for k, v in by_part.items() if k != args.val for e in v]
-    val_entries = by_part[args.val]
     train_samples = load_samples(train_entries, args.structures)
     val_samples = load_samples(val_entries, args.structures)
     n_tr = sum(1 for *_, c in train_samples if c is not None)
     n_va = sum(1 for *_, c in val_samples if c is not None)
-    logger.info(f"train={len(train_samples)} ({n_tr} w/ struct)  "
+    logger.info(f"fold={args.fold}  train={len(train_samples)} ({n_tr} w/ struct)  "
                 f"val={len(val_samples)} ({n_va} w/ struct)")
     if n_tr == 0:
         p.error("no structure-backed training samples found — check --structures path")
@@ -160,11 +188,28 @@ def main() -> None:
     res = train(model, train_samples, val_samples, args.max_seconds, seed=args.seed)
     logger.info(f"Done: best val_auc={res['best_auc']:.4f} steps={res['steps']} {time.time()-t0:.0f}s")
 
+    test_aucs = {}
+    for ef, by_part_eval in eval_by_fasta.items():
+        test_entries = by_part_eval.get(test_label, [])
+        test_samples = load_samples(test_entries, args.structures)
+        test_aucs[eval_name(ef)] = evaluate_auc(model, test_samples)
+    for name, auc in test_aucs.items():
+        logger.info(f"test_auc[{name}]={auc:.4f}")
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"config": model.config(),
                 "trainable_state": model.trainable_state_dict(),
-                "val_auc": res["best_auc"]}, args.out)
+                "fasta": str(args.fasta),
+                "fold": args.fold,
+                "val_auc": res["best_auc"],
+                "test_auc": test_aucs}, args.out)
     logger.info(f"Saved checkpoint -> {args.out}")
+
+    metrics_path = args.out.with_suffix(".metrics.json")
+    metrics_path.write_text(json.dumps({
+        "fasta": str(args.fasta), "fold": args.fold, "steps": res["steps"],
+        "seconds": round(time.time() - t0), "val_auc": res["best_auc"], "test_auc": test_aucs,
+    }, indent=2))
 
 
 if __name__ == "__main__":

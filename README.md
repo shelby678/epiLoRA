@@ -16,9 +16,10 @@ attention projections, its top encoder layers are replayed once (**RYS** =
 
 ```
 model.py            ESM-IF1 + LoRA + RYS + head (the model)
-data.py             training-data loading (labelled FASTA + PDB structures)
-train.py            train the model, save a checkpoint
+data.py             training-data loading (labelled FASTA + mmCIF structures)
+train.py            train one fold of one ablation, save a checkpoint
 predict.py          run a trained checkpoint on a PDB -> per-residue scores
+ablation/           run_ablation.py -- 5-fold CV sweep across data ablations
 requirements.txt    pinned dependencies (Python 3.9)
 weights/            trained checkpoints go here (not committed) — see weights/README.md
 data/               your training data goes here (not committed) — see data/README.md
@@ -64,17 +65,31 @@ chain is used.
 
 ## Train
 
-Put your labelled data under `data/` (format in [`data/README.md`](data/README.md)),
-then:
+Data prep (`data/data_prep.smk`, see [`data/README.md`](data/README.md)) turns raw
+SAbDab structures into a set of ablation FASTAs under `data/train_test_eval/`,
+each carrying a 5-fold CV label (`i.j`) per record. Train one fold of one
+ablation with:
 
 ```bash
 python train.py \
-    --fasta data/BEPIPRED.fasta \
-    --structures data/structures2/sabdab_dataset \
-    --out weights/epilora_if1.pt
+    --fasta data/train_test_eval/all_epitopes.fasta \
+    --structures data/raw/all-structures-extracted \
+    --fold 1 \
+    --out weights/all_epitopes_fold1.pt
 ```
 
-Trains on every non-`EVAL` partition, holds out one partition (`--val`, default
-`5`) for early stopping, and saves the trainable weights (LoRA adapters + head,
-~0.5 MB) plus config to `--out`. The frozen ESM-IF1 backbone is not stored — it
-is re-downloaded on load.
+Trains on every record in `--fasta` whose fold != `--fold`. Early stopping and
+test-set reporting always use a **fixed shared benchmark** (`--eval-fastas`,
+default the homo-sapiens and homo-sapiens+mus-musculus ablations) rather than
+`--fasta`'s own fold split — so every ablation's model is judged on the same
+held-out human epitopes, making cross-ablation comparisons apples-to-apples.
+Saves the trainable weights (LoRA adapters + head, ~0.5 MB) plus config and
+metrics to `--out`. The frozen ESM-IF1 backbone is not stored — it is
+re-downloaded on load.
+
+To compare ablations, run the full sweep (8 datasets x 5 folds) and get a
+ranked summary:
+
+```bash
+python ablation/run_ablation.py --max-seconds 3600
+```
