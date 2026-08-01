@@ -28,6 +28,7 @@ LORA_ALPHA = 8.0
 LORA_LAYERS = 8          # LoRA on all 8 ESM-IF1 encoder layers
 RYS_START, RYS_END = 4, 8  # replay encoder layers [4, 8) once
 DROPOUT = 0.1
+HEAD_DIM = None          # None = direct Linear(hidden, 1); else Linear-act-Linear MLP
 HIDDEN = 512             # ESM-IF1 encoder output dim
 N_ENCODER_LAYERS = 8
 
@@ -72,17 +73,39 @@ class LoRALinear(nn.Module):
         return self.orig.out_features
 
 
-def inject_lora(esm_model, rank: int, alpha: float, n_layers: int) -> None:
-    """Add LoRA adapters to q/k/v/out projections of the last ``n_layers``."""
-    start = max(0, N_ENCODER_LAYERS - n_layers)
-    for i in range(start, N_ENCODER_LAYERS):
-        attn = esm_model.encoder.layers[i].self_attn
+def inject_lora_layers(layers, rank: int, alpha: float, n_layers: int) -> None:
+    """Add LoRA adapters to q/k/v/out projections of the last ``n_layers`` of ``layers``.
+
+    ``layers`` is any indexable sequence of transformer blocks exposing a
+    ``.self_attn`` with fair-esm's ``MultiheadAttention`` (q/k/v/out_proj) --
+    true for ESM-IF1's encoder, ESM2, and ESM3's transformer stack alike, so
+    this one function backs LoRA injection for every backbone.
+    """
+    total = len(layers)
+    start = max(0, total - n_layers)
+    for i in range(start, total):
+        attn = layers[i].self_attn
         # Force the manual q/k/v path so LoRA.forward is actually invoked; the
         # fused F.multi_head_attention_forward fast path reads q_proj.weight
         # directly and would silently bypass the adapter.
         attn.enable_torch_version = False
         for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
             setattr(attn, name, LoRALinear(getattr(attn, name), rank, alpha))
+
+
+def inject_lora(esm_model, rank: int, alpha: float, n_layers: int) -> None:
+    """Add LoRA adapters to q/k/v/out projections of ESM-IF1's last ``n_layers``."""
+    inject_lora_layers(esm_model.encoder.layers, rank, alpha, n_layers)
+
+
+def build_head(hidden: int, head_dim: int | None, dropout: float) -> nn.Module:
+    """Per-residue scoring head: direct Linear(hidden,1) if ``head_dim`` is None,
+    else an MLP Linear(hidden,head_dim) -> GELU -> Dropout -> Linear(head_dim,1)."""
+    if head_dim is None:
+        return nn.Linear(hidden, 1)
+    return nn.Sequential(
+        nn.Linear(hidden, head_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(head_dim, 1)
+    )
 
 
 def patch_encoder_rys(encoder, rys_start: int, rys_end: int) -> None:
@@ -115,13 +138,14 @@ class ESMIF1EpitopeModel(nn.Module):
 
     def __init__(self, esm_model, alphabet, rank=LORA_RANK, alpha=LORA_ALPHA,
                  n_lora_layers=LORA_LAYERS, rys_start=RYS_START, rys_end=RYS_END,
-                 dropout=DROPOUT):
+                 dropout=DROPOUT, head_dim=HEAD_DIM):
         super().__init__()
         self.esm = esm_model
         self.alphabet = alphabet
         self.hidden = HIDDEN
         self._cfg = dict(rank=rank, alpha=alpha, n_lora_layers=n_lora_layers,
-                         rys_start=rys_start, rys_end=rys_end, dropout=dropout)
+                         rys_start=rys_start, rys_end=rys_end, dropout=dropout,
+                         head_dim=head_dim)
         for p in self.esm.parameters():
             p.requires_grad = False
         inject_lora(self.esm, rank, alpha, n_lora_layers)
@@ -129,11 +153,11 @@ class ESMIF1EpitopeModel(nn.Module):
             patch_encoder_rys(self.esm.encoder, rys_start, rys_end)
         self.head_ln = nn.LayerNorm(self.hidden)
         self.head_drop = nn.Dropout(dropout)
-        self.head = nn.Linear(self.hidden, 1)
+        self.head = build_head(self.hidden, head_dim, dropout)
 
     @property
     def device(self):
-        return self.head.weight.device
+        return self.head_ln.weight.device
 
     def _encode(self, coords_batch, seq_batch):
         # Stock fair-esm inverse-folding collate (pads coords, builds mask/confidence).

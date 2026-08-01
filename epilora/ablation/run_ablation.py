@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -31,6 +32,10 @@ BENCHMARKS = ("homo_sapiens", "homo_sapiens_mus_musculus")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_PY = Path(__file__).resolve().parents[1] / "train.py"
+# train.py needs fair-esm/biotite/torch-geometric, which live in this dedicated venv
+# (the shared base env this repo used to rely on has proven mutable/unstable).
+ENV_PYTHON = REPO_ROOT / "epilora/env/bin/python3"
+TRAIN_PYTHON = str(ENV_PYTHON) if ENV_PYTHON.exists() else sys.executable
 
 CSV_FIELDS = ["dataset", "fold", "val_auc", *[f"test_auc_{b}" for b in BENCHMARKS],
               "steps", "seconds", "status"]
@@ -55,7 +60,7 @@ def run_job(dataset: Path, fold: int, gpu_id: int, args, csv_lock, csv_path) -> 
 
     # Resolve to absolute paths: the subprocess below runs with cwd=TRAIN_PY.parent,
     # which would otherwise break any relative paths passed on argv.
-    cmd = [sys.executable, str(TRAIN_PY),
+    cmd = [TRAIN_PYTHON, str(TRAIN_PY),
            "--fasta", str(dataset.resolve()), "--structures", str(args.structures.resolve()),
            "--fold", str(fold), "--out", str(out),
            "--max-seconds", str(args.max_seconds), "--seed", str(args.seed)]
@@ -161,19 +166,23 @@ def main() -> None:
           f"{n_workers} parallel workers, results -> {args.results}")
 
     csv_lock = threading.Lock()
-    semaphore = threading.Semaphore(n_workers)
+    # A pool of free GPU ids (rather than gpu_id = i % n_workers) so a fast-finishing
+    # job frees its GPU for immediate reuse instead of leaving that GPU idle while
+    # another GPU gets double-booked.
+    gpu_pool: queue.Queue = queue.Queue()
+    for g in range(n_workers):
+        gpu_pool.put(g)
     threads = []
 
-    def worker(dataset, fold, gpu_id):
+    def worker(dataset, fold):
+        gpu_id = gpu_pool.get()
         try:
             run_job(dataset, fold, gpu_id, args, csv_lock, args.results)
         finally:
-            semaphore.release()
+            gpu_pool.put(gpu_id)
 
-    for i, (dataset, fold) in enumerate(jobs):
-        semaphore.acquire()
-        gpu_id = i % n_workers
-        t = threading.Thread(target=worker, args=(dataset, fold, gpu_id))
+    for dataset, fold in jobs:
+        t = threading.Thread(target=worker, args=(dataset, fold))
         t.start()
         threads.append(t)
     for t in threads:

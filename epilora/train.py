@@ -39,8 +39,8 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 
 from data import load_samples, parse_fasta
-from model import (LORA_ALPHA, LORA_LAYERS, LORA_RANK, RYS_END, RYS_START,
-                   build_model)
+from model import (DROPOUT, HEAD_DIM, LORA_ALPHA, LORA_LAYERS, LORA_RANK,
+                   RYS_END, RYS_START, build_model)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -143,8 +143,9 @@ def eval_name(path: Path) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fasta", type=Path, default=REPO_ROOT / "data/train_test_eval/all_epitopes.fasta",
-                   help="ablation FASTA to train on")
+    p.add_argument("--fasta", type=Path,
+                   default=REPO_ROOT / "data/train_test_eval/allowed_species_homo_sapiens_min_resolution_10_epitopes.fasta",
+                   help="ablation FASTA to train on (default recipe: human-only antibodies, <=10A resolution)")
     p.add_argument("--structures", type=Path, default=REPO_ROOT / "data/raw/all-structures-extracted")
     p.add_argument("--out", type=Path, default=REPO_ROOT / "weights/epilora_if1.pt")
     p.add_argument("--fold", type=int, default=1, choices=[1, 2, 3, 4, 5],
@@ -157,6 +158,25 @@ def main() -> None:
     p.add_argument("--max-seconds", type=int, default=3600)
     p.add_argument("--seed", type=int, default=42,
                    help="seed for dataset shuffling and LoRA/head weight init")
+    p.add_argument("--backbone", choices=["esmif1", "esm2", "esm3"], default="esmif1",
+                   help="pretrained model to adapt: esmif1 (structure, champion), "
+                        "esm2/esm3 (sequence-only, for the backbone ablation)")
+    p.add_argument("--esm2-size", choices=["35M", "150M", "650M"], default="650M",
+                   help="ESM2 checkpoint size (only used when --backbone esm2)")
+    p.add_argument("--lora-rank", type=int, default=LORA_RANK)
+    p.add_argument("--lora-alpha", type=float, default=LORA_ALPHA)
+    p.add_argument("--lora-layers", type=int, default=LORA_LAYERS,
+                   help="number of top transformer layers to adapt with LoRA")
+    p.add_argument("--rys-start", type=int, default=RYS_START,
+                   help="replay window start (esmif1 backbone only; ignored otherwise)")
+    p.add_argument("--rys-end", type=int, default=RYS_END,
+                   help="replay window end, exclusive; rys_end<=rys_start disables RYS "
+                        "(esmif1 backbone only; ignored otherwise)")
+    p.add_argument("--head-dim", type=int, default=HEAD_DIM,
+                   help="if set, use an MLP head Linear(hidden,head_dim)-GELU-Linear(.,1) "
+                        "instead of the default direct Linear(hidden,1)")
+    p.add_argument("--dropout", type=float, default=DROPOUT,
+                   help="dropout applied in the head (and MLP head hidden layer, if used)")
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -182,8 +202,20 @@ def main() -> None:
     if n_tr == 0:
         p.error("no structure-backed training samples found — check --structures path")
 
-    model = build_model(device=DEVICE, rank=LORA_RANK, alpha=LORA_ALPHA,
-                        n_lora_layers=LORA_LAYERS, rys_start=RYS_START, rys_end=RYS_END)
+    if args.backbone == "esmif1":
+        model = build_model(device=DEVICE, rank=args.lora_rank, alpha=args.lora_alpha,
+                            n_lora_layers=args.lora_layers, rys_start=args.rys_start,
+                            rys_end=args.rys_end, dropout=args.dropout, head_dim=args.head_dim)
+    elif args.backbone == "esm2":
+        from model_esm2 import build_model as build_model_esm2
+        model = build_model_esm2(device=DEVICE, size=args.esm2_size, rank=args.lora_rank,
+                                 alpha=args.lora_alpha, n_lora_layers=args.lora_layers,
+                                 dropout=args.dropout, head_dim=args.head_dim)
+    else:
+        from model_esm3 import build_model as build_model_esm3
+        model = build_model_esm3(device=DEVICE, rank=args.lora_rank, alpha=args.lora_alpha,
+                                 n_lora_layers=args.lora_layers, dropout=args.dropout,
+                                 head_dim=args.head_dim)
     t0 = time.time()
     res = train(model, train_samples, val_samples, args.max_seconds, seed=args.seed)
     logger.info(f"Done: best val_auc={res['best_auc']:.4f} steps={res['steps']} {time.time()-t0:.0f}s")
@@ -197,17 +229,20 @@ def main() -> None:
         logger.info(f"test_auc[{name}]={auc:.4f}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"config": model.config(),
+    torch.save({"backbone": args.backbone,
+                "config": model.config(),
                 "trainable_state": model.trainable_state_dict(),
                 "fasta": str(args.fasta),
                 "fold": args.fold,
+                "seed": args.seed,
                 "val_auc": res["best_auc"],
                 "test_auc": test_aucs}, args.out)
     logger.info(f"Saved checkpoint -> {args.out}")
 
     metrics_path = args.out.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps({
-        "fasta": str(args.fasta), "fold": args.fold, "steps": res["steps"],
+        "backbone": args.backbone, "fasta": str(args.fasta), "fold": args.fold,
+        "seed": args.seed, "steps": res["steps"],
         "seconds": round(time.time() - t0), "val_auc": res["best_auc"], "test_auc": test_aucs,
     }, indent=2))
 

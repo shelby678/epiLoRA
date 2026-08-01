@@ -18,15 +18,28 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from model import ESMIF1EpitopeModel, load_base_esmif1
 
 
-def load_model(weights: Path, device: str) -> ESMIF1EpitopeModel:
+def load_model(weights: Path, device: str) -> nn.Module:
+    """Load a checkpoint saved by train.py, dispatching on its ``backbone`` field
+    (older checkpoints predate that field and default to esmif1)."""
     ckpt = torch.load(weights, map_location="cpu", weights_only=False)
     cfg = ckpt.get("config", {})
-    esm_model, alphabet = load_base_esmif1()
-    model = ESMIF1EpitopeModel(esm_model, alphabet, **cfg).to(device)
+    backbone = ckpt.get("backbone", "esmif1")
+    if backbone == "esmif1":
+        esm_model, alphabet = load_base_esmif1()
+        model = ESMIF1EpitopeModel(esm_model, alphabet, **cfg).to(device)
+    elif backbone == "esm2":
+        from model_esm2 import ESM2EpitopeModel, load_base_esm2
+        esm_model, alphabet = load_base_esm2(cfg["size"])
+        model = ESM2EpitopeModel(esm_model, alphabet, **cfg).to(device)
+    else:
+        from model_esm3 import ESM3EpitopeModel, load_base_esm3
+        esm_model = load_base_esm3()
+        model = ESM3EpitopeModel(esm_model, **cfg).to(device)
     model.load_trainable_state_dict(ckpt["trainable_state"])
     model.eval()
     return model
