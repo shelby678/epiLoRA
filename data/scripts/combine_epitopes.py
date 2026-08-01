@@ -1,8 +1,8 @@
 """Combine per-cluster member epitope calls onto a representative sequence.
 
 Reads the per-cluster block format written by cluster_fasta.py. A member contributes its
-epitope (lowercase) calls to the combined sequence -- and counts toward --min_num_clusters --
-only if it passes --allowed_species and --min_resolution. If the cluster's original
+epitope (lowercase) calls to the combined sequence only if it passes --allowed_species and
+--min_resolution; a cluster with no qualifying members is dropped. If the cluster's original
 representative passes, it's used as the coordinate backbone as before. If it doesn't, a new
 representative is elected from the qualifying members: whichever has the fewest MSA gaps
 ('-') in its column-aligned sequence (i.e. the most complete coverage), ties broken by
@@ -41,10 +41,8 @@ def main():
     p.add_argument("log_path")
     p.add_argument("--allowed_species", default=None,
                     help='pipe-separated list, e.g. "homo sapiens|mus musculus" (default: all species allowed)')
-    p.add_argument("--min_resolution", type=float, default=5.0,
+    p.add_argument("--min_resolution", type=float, default=100.0,
                     help="keep only members with resolution <= this value (Angstrom)")
-    p.add_argument("--min_num_clusters", type=int, default=1,
-                    help="minimum number of qualifying members required to keep a cluster")
     args = p.parse_args()
 
     ablation_parts = []
@@ -52,12 +50,10 @@ def main():
     if args.allowed_species is not None:
         allowed_species = {s.strip().replace(" ", "_") for s in args.allowed_species.split("|")}
         ablation_parts.append("allowed_species_" + "_".join(sorted(allowed_species)))
-    if args.min_resolution != 5.0:
+    if args.min_resolution != 100.0:
         val = args.min_resolution
         param = str(int(val)) if val == int(val) else str(val)
         ablation_parts.append(f"min_resolution_{param}")
-    if args.min_num_clusters != 1:
-        ablation_parts.append(f"min_num_clusters_{args.min_num_clusters}")
 
     name = "_".join(ablation_parts) if ablation_parts else "all"
     out_path = Path(args.out_dir) / f"{name}_epitopes.fasta"
@@ -83,7 +79,7 @@ def main():
                     rep = m
 
             qualifying = [m for m in parsed if m["qualifies"]]
-            if len(qualifying) < args.min_num_clusters:
+            if not qualifying:
                 continue
 
             # Prefer the original representative as backbone; if it doesn't pass the filters,

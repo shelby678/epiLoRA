@@ -4,8 +4,6 @@ import sys
 
 in_tsv, out_tsv, log_path = sys.argv[1:4]
 
-MAX_RESOLUTION = 5.0
-
 
 with open(in_tsv, newline="") as f:
     reader = csv.DictReader(f, delimiter="\t")
@@ -22,8 +20,6 @@ for row in rows:
     if row["antigen_chain"] in ("", "NA"):
         continue
     if "PROTEIN" not in (row["antigen_type"] or "").upper():
-        continue
-    if row["resolution"] in ("", "NA") or float(row["resolution"]) > MAX_RESOLUTION:
         continue
     kept.append(row)
     species_seen.add(row["heavy_species"])

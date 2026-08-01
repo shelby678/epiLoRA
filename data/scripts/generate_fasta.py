@@ -6,7 +6,7 @@ from structures import chain_sequence, load_model
 
 in_tsv, structures_dir, out_fasta, log_path = sys.argv[1:5]
 
-MIN_LEN = 100
+MIN_LEN = 60
 MAX_LEN = 1300
 
 n_written = n_skipped_no_seq = n_skipped_len = 0

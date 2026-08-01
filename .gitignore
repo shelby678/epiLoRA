@@ -1,4 +1,9 @@
 ./benchmarking/
+data/train_test_eval/
+epilora/ablation/hparam_results.csv
+benchmarking/
+epilora/env
+epilora/env_esm3
 data/*/structures/
 claude.md
 data/test*
