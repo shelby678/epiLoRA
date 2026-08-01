@@ -14,6 +14,8 @@ data/results/
 epilora/ablation/logs/
 epilora/ablation/results.csv
 weights/
+.claude/
+data/train_test_eval/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
