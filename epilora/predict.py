@@ -33,13 +33,17 @@ def load_model(weights: Path, device: str) -> nn.Module:
         esm_model, alphabet = load_base_esmif1()
         model = ESMIF1EpitopeModel(esm_model, alphabet, **cfg).to(device)
     elif backbone == "esm2":
-        from model_esm2 import ESM2EpitopeModel, load_base_esm2
+        from model import ESM2EpitopeModel, load_base_esm2
         esm_model, alphabet = load_base_esm2(cfg["size"])
         model = ESM2EpitopeModel(esm_model, alphabet, **cfg).to(device)
-    else:
-        from model_esm3 import ESM3EpitopeModel, load_base_esm3
+    elif backbone == "esm3":
+        from model import ESM3EpitopeModel, load_base_esm3
         esm_model = load_base_esm3()
         model = ESM3EpitopeModel(esm_model, **cfg).to(device)
+    else:
+        from model import ESMCEpitopeModel, load_base_esmc
+        esm_model = load_base_esmc(cfg["size"])
+        model = ESMCEpitopeModel(esm_model, **cfg).to(device)
     model.load_trainable_state_dict(ckpt["trainable_state"])
     model.eval()
     return model
