@@ -5,6 +5,11 @@ benchmarking/
 epilora/env
 epilora/env_esm3
 epilora/ablation/*csv
+epilora/configs/
+epilora/ablation/results/
+epilora/wandb/
+# conda env
+epilora/env_esm3.2/ 
 
 data/raw/
 data/archive/
