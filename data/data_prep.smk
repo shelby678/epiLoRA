@@ -1,3 +1,4 @@
+RAW_CSV = config.get("raw_csv", "raw/sabdab_summary_all.csv")
 RAW_TSV = config.get("raw_tsv", "raw/sabdab_summary_all.tsv")
 STRUCTURES_DIR = config.get("structures_dir", "raw/all-structures-extracted")
 RESULTS_DIR = config.get("results_dir", "results")
@@ -19,6 +20,21 @@ rule all:
         f"{TTE_DIR}/min_resolution_10_epitopes.fasta",
         f"{TTE_DIR}/min_resolution_15_epitopes.fasta",
         f"{TTE_DIR}/allowed_species_homo_sapiens_min_resolution_10_epitopes.fasta"
+
+"""
+Convert the raw SAbDab summary csv to tsv. Some fields (antigen_name,
+authors, ...) contain literal commas inside quoted values, so this is a
+proper quote-aware csv->tsv conversion, not a naive comma->tab replace.
+"""
+rule rule_csv_to_tsv:
+    input:
+        RAW_CSV
+    output:
+        RAW_TSV
+    log:
+        f"{LOGS_DIR}/rule_csv_to_tsv.log"
+    shell:
+        "python3 scripts/csv_to_tsv.py {input} {output} {log}"
 
 """
 Filter the sabdab tsv according to following constraints:
