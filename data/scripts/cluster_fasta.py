@@ -2,12 +2,16 @@
 
 Output format (fasta-like, one block per cluster)::
 
-    >>CLUSTER {rep_instance} {antigen_chains} {fold_label}
-    >{instance} {date} {resolution} {heavy_species} {light_species}
+    >>CLUSTER {rep_instance} {fold_label}
+    >{instance} {date} {resolution} {antigen_chains} {heavy_species} {light_species}
     {seq aligned to the cluster's shared frame, '-' where this member has no residue at that column}
     >{instance2} ...
     {seq2...}
     >>CLUSTER ...
+
+Each member carries its own antigen_chains (rather than only the cluster header
+carrying the representative's) so that combine_epitopes.py can elect a different
+member as backbone without stranding it with the wrong PDB entry's chain IDs.
 """
 import os
 import random
@@ -44,7 +48,9 @@ def parse_fasta(path):
 def parse_member_row(aligned_row, member_seq):
     """Split an mmseqs A3M row into per-rep-column chars (None = deletion) and insertion
     runs (case-preserved), keyed by the rep column each insertion precedes (rep_len itself
-    keys a trailing insertion after the last column)."""
+    keys a trailing insertion after the last column). mmseqs2's alignment is local, so it can
+    stop short of member_seq's own end; whatever it doesn't cover is kept as part of that
+    trailing insertion instead of silently dropped."""
     chars_by_col = []
     insertions = {}
     rep_col = mem_pos = 0
@@ -69,9 +75,9 @@ def parse_member_row(aligned_row, member_seq):
             chars_by_col.append(member_seq[mem_pos])
             rep_col += 1
             mem_pos += 1
-    if run_start is not None:
-        # trailing insertion after the last rep column
-        insertions[rep_col] = member_seq[run_start:mem_pos]
+    tail_start = run_start if run_start is not None else mem_pos
+    if tail_start < len(member_seq):
+        insertions[rep_col] = member_seq[tail_start:]
     return chars_by_col, insertions
 
 
@@ -141,8 +147,7 @@ with tempfile.TemporaryDirectory() as tmp:
         for rep_index, entries in parsed_clusters:
             # the rep's original header carries the metadata written on the >>CLUSTER line
             rep_header, rep_seq = records[rep_index]
-            rep_fields = rep_header.split()
-            rep_instance, antigen_chains = rep_fields[0], rep_fields[3]
+            rep_instance = rep_header.split()[0]
             fold_label = random.choice(FOLD_LABELS)
             rep_len = len(rep_seq)
 
@@ -160,11 +165,11 @@ with tempfile.TemporaryDirectory() as tmp:
                         max_len[point] = len(ins)
 
             # write the cluster header followed by each member's header + aligned sequence
-            out.write(f">>CLUSTER {rep_instance} {antigen_chains} {fold_label}\n")
+            out.write(f">>CLUSTER {rep_instance} {fold_label}\n")
             for member_header, chars_by_col, insertions in parsed_members:
-                m_instance, m_date, m_resolution, _, m_heavy, m_light = member_header.split()[:6]
+                m_instance, m_date, m_resolution, m_chains, m_heavy, m_light = member_header.split()[:6]
                 aligned_seq = render_row(rep_len, chars_by_col, insertions, max_len)
-                out.write(f">{m_instance} {m_date} {m_resolution} {m_heavy} {m_light}\n")
+                out.write(f">{m_instance} {m_date} {m_resolution} {m_chains} {m_heavy} {m_light}\n")
                 out.write(aligned_seq + "\n")
             n_clusters += 1
 

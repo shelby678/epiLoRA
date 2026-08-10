@@ -62,18 +62,19 @@ def main():
     with open(out_path, "w") as out:
         for cluster_header, members in parse_clusters(args.in_fasta):
             n_clusters_in += 1
-            rep_instance, antigen_chains, fold_label = cluster_header.split()
+            rep_instance, fold_label = cluster_header.split()
 
             parsed = []
             rep = None
             for header, seq in members:
-                instance, date, resolution, heavy_species, light_species = header.split()
+                instance, date, resolution, chains, heavy_species, light_species = header.split()
                 species_ok = allowed_species is None or (
                     heavy_species in allowed_species and light_species in allowed_species
                 )
                 resolution_ok = resolution not in ("", "NA") and float(resolution) <= args.min_resolution
-                m = dict(instance=instance, date=date, resolution=resolution, heavy_species=heavy_species,
-                         light_species=light_species, seq=seq, qualifies=species_ok and resolution_ok)
+                m = dict(instance=instance, date=date, resolution=resolution, chains=chains,
+                         heavy_species=heavy_species, light_species=light_species, seq=seq,
+                         qualifies=species_ok and resolution_ok)
                 parsed.append(m)
                 if instance == rep_instance:
                     rep = m
@@ -100,7 +101,7 @@ def main():
             combined_seq = "".join(c.lower() if ep else c.upper() for c, ep in zip(backbone_seq, epitope))
             oldest_date = min(m["date"] for m in qualifying)
             out.write(
-                f">{backbone['instance']} {oldest_date} {backbone['resolution']} {antigen_chains} "
+                f">{backbone['instance']} {oldest_date} {backbone['resolution']} {backbone['chains']} "
                 f"{backbone['heavy_species']} {backbone['light_species']} n={len(qualifying)} {fold_label}\n"
             )
             out.write(combined_seq + "\n")

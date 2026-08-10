@@ -74,8 +74,8 @@ This is prepartion for data ablation, in which  we filter the clusters according
 we're testing and combine epitope markers into one representative sequence, i.e. if this residue is marked as epitope
 in some seq in the cluster, mark it as epitope in the rep.
 
-    >>CLUSTER {rep_instance} {antigen_chains} {fold_label}
-    >{instance} {date} {resolution} {heavy_species} {light_species}
+    >>CLUSTER {rep_instance} {fold_label}
+    >{instance} {date} {resolution} {antigen_chains} {heavy_species} {light_species}
     {seq aligned to the cluster's shared frame, '-' where this member has no residue at that column}
     >{instance2} ...
     {seq2...}
