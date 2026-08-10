@@ -27,17 +27,39 @@ import sys
 import threading
 from pathlib import Path
 
+import yaml
+
 FOLDS = (1, 2, 3, 4, 5)
 BENCHMARKS = ("homo_sapiens", "homo_sapiens_mus_musculus")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TRAIN_PY = Path(__file__).resolve().parents[1] / "train.py"
-# train.py needs fair-esm/biotite/torch-geometric, which live in this dedicated venv
-# (the shared base env this repo used to rely on has proven mutable/unstable).
-ENV_PYTHON = REPO_ROOT / "epilora/env/bin/python3"
-TRAIN_PYTHON = str(ENV_PYTHON) if ENV_PYTHON.exists() else sys.executable
+EPILORA_DIR = Path(__file__).resolve().parents[1]
+TRAIN_PY = EPILORA_DIR / "train.py"
+CONFIGS_DIR = EPILORA_DIR / "configs"
 
-CSV_FIELDS = ["dataset", "fold", "val_auc", *[f"test_auc_{b}" for b in BENCHMARKS],
+# Machine-specific env locations -- edit epilora/machine_config.yaml, not this.
+_machine_cfg = yaml.safe_load((EPILORA_DIR / "machine_config.yaml").read_text())
+ENV_PYTHON = (EPILORA_DIR / _machine_cfg["env"]).resolve() / "bin" / "python3"
+ENV_ESM3_PYTHON = (EPILORA_DIR / _machine_cfg["env_esm3"]).resolve() / "bin" / "python3"
+
+
+def train_python_for(backbone: str) -> str:
+    env_python = ENV_ESM3_PYTHON if backbone in ("esm3", "esmc") else ENV_PYTHON
+    return str(env_python) if env_python.exists() else sys.executable
+
+
+def config_for(args) -> Path | None:
+    """train.py's --config for the sweep's fixed --backbone (None = the esmif1 champion)."""
+    if args.backbone == "esmif1":
+        return None
+    if args.backbone == "esm2":
+        return CONFIGS_DIR / f"backbone_esm2_{args.esm2_size}.yaml"
+    if args.backbone == "esm3":
+        return CONFIGS_DIR / "backbone_esm3.yaml"
+    return CONFIGS_DIR / f"backbone_esmc_{args.esmc_size}.yaml"
+
+
+CSV_FIELDS = ["dataset", "fold", "backbone", "val_auc", *[f"test_auc_{b}" for b in BENCHMARKS],
               "steps", "seconds", "status"]
 
 
@@ -55,15 +77,21 @@ def gpu_count() -> int:
 
 def run_job(dataset: Path, fold: int, gpu_id: int, args, csv_lock, csv_path) -> None:
     stem = dataset.stem.removesuffix("_epitopes")
-    out = (args.weights_dir / f"{stem}_fold{fold}.pt").resolve()
-    log_path = args.log_dir / f"{stem}_fold{fold}.log"
+    out = (args.weights_dir / f"{stem}_fold{fold}_{args.backbone}.pt").resolve()
+    log_path = args.log_dir / f"{stem}_fold{fold}_{args.backbone}.log"
 
     # Resolve to absolute paths: the subprocess below runs with cwd=TRAIN_PY.parent,
     # which would otherwise break any relative paths passed on argv.
-    cmd = [TRAIN_PYTHON, str(TRAIN_PY),
+    cmd = [train_python_for(args.backbone), str(TRAIN_PY),
            "--fasta", str(dataset.resolve()), "--structures", str(args.structures.resolve()),
            "--fold", str(fold), "--out", str(out),
            "--max-seconds", str(args.max_seconds), "--seed", str(args.seed)]
+    cfg_path = config_for(args)
+    if cfg_path is not None:
+        cmd += ["--config", str(cfg_path)]
+    if args.wandb:
+        cmd += ["--wandb", "--wandb-project", args.wandb_project,
+                "--wandb-run-name", f"{stem}_fold{fold}_{args.backbone}"]
     full_env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
 
     print(f"[{stem} fold={fold} gpu={gpu_id}] starting -> {log_path}", flush=True)
@@ -71,7 +99,7 @@ def run_job(dataset: Path, fold: int, gpu_id: int, args, csv_lock, csv_path) -> 
         proc = subprocess.run(cmd, cwd=str(TRAIN_PY.parent), env=full_env,
                               stdout=logf, stderr=subprocess.STDOUT)
 
-    row = {"dataset": stem, "fold": fold, "val_auc": "", "steps": "", "seconds": "",
+    row = {"dataset": stem, "fold": fold, "backbone": args.backbone, "val_auc": "", "steps": "", "seconds": "",
            "status": "ok" if proc.returncode == 0 else f"FAILED (rc={proc.returncode})"}
     for b in BENCHMARKS:
         row[f"test_auc_{b}"] = ""
@@ -138,8 +166,14 @@ def main() -> None:
     p.add_argument("--weights-dir", type=Path, default=REPO_ROOT / "weights/ablation")
     p.add_argument("--log-dir", type=Path, default=Path(__file__).resolve().parent / "logs")
     p.add_argument("--results", type=Path, default=Path(__file__).resolve().parent / "results.csv")
-    p.add_argument("--max-seconds", type=int, default=3600)
+    p.add_argument("--max-seconds", type=int, default=14400)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--backbone", choices=["esmif1", "esm2", "esm3", "esmc"], default="esmif1",
+                   help="pretrained model to adapt for every job in the sweep")
+    p.add_argument("--esm2-size", choices=["35M", "150M", "650M"], default="650M",
+                   help="ESM2 checkpoint size (only used when --backbone esm2)")
+    p.add_argument("--esmc-size", choices=["300M", "600M"], default="600M",
+                   help="ESMc checkpoint size (only used when --backbone esmc)")
     p.add_argument("--folds", type=int, nargs="+", default=list(FOLDS))
     p.add_argument("--datasets", type=Path, nargs="+", default=None,
                    help="override dataset list (default: all *_epitopes.fasta in --tte-dir)")
@@ -147,6 +181,8 @@ def main() -> None:
                    help="parallel jobs (default: number of visible GPUs)")
     p.add_argument("--summarize-only", action="store_true",
                    help="skip training, just print the summary from --results")
+    p.add_argument("--wandb", action="store_true", help="log every job in the sweep to Weights & Biases")
+    p.add_argument("--wandb-project", default="epilora", help="W&B project name (only used with --wandb)")
     args = p.parse_args()
 
     if args.summarize_only:

@@ -1,0 +1,11 @@
+# Machine-specific paths. Edit this file for your machine -- nothing else
+# needs to change. Paths are resolved relative to this file's directory
+# (epilora/) unless given as absolute paths.
+
+# Fair-esm env (ESM-IF1, ESM2). See ../README.md's Install section.
+env: env
+
+# EvolutionaryScale env (ESM3, ESMc). Separate from `env` above because
+# EvolutionaryScale's `esm` pip package collides by import name with
+# fair-esm's `esm` and the two can't be installed together.
+env_esm3: env_esm3

@@ -31,55 +31,52 @@ import sys
 import threading
 from pathlib import Path
 
+import yaml
+
 FOLDS = (1, 2, 3, 4, 5)
 BENCHMARKS = ("homo_sapiens", "homo_sapiens_mus_musculus")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TRAIN_PY = Path(__file__).resolve().parents[1] / "train.py"
+EPILORA_DIR = Path(__file__).resolve().parents[1]
+TRAIN_PY = EPILORA_DIR / "train.py"
+CONFIGS_DIR = EPILORA_DIR / "configs"
 CHAMPION_DATASET = REPO_ROOT / "data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta"
 
 # ESM3 (EvolutionaryScale's "esm" pip package) and fair-esm (ESM-IF1/ESM2, also imported
 # as "esm") collide on the same top-level import name, so they live in two separate venvs;
 # pick the right interpreter per job based on which backbone the config asks for.
-ENV_PYTHON = REPO_ROOT / "epilora/env/bin/python3"
-ENV_ESM3_PYTHON = REPO_ROOT / "epilora/env_esm3/bin/python3"
+# Machine-specific env locations -- edit epilora/machine_config.yaml, not this.
+_machine_cfg = yaml.safe_load((EPILORA_DIR / "machine_config.yaml").read_text())
+ENV_PYTHON = (EPILORA_DIR / _machine_cfg["env"]).resolve() / "bin" / "python3"
+ENV_ESM3_PYTHON = (EPILORA_DIR / _machine_cfg["env_esm3"]).resolve() / "bin" / "python3"
+
+
+def config_path(config_name: str) -> Path:
+    return CONFIGS_DIR / f"{config_name}.yaml"
 
 
 def python_for(config_name: str) -> str:
-    if "--backbone" in CONFIGS[config_name] and "esm3" in CONFIGS[config_name]:
+    if yaml.safe_load(config_path(config_name).read_text()).get("backbone") == "esm3":
         return str(ENV_ESM3_PYTHON) if ENV_ESM3_PYTHON.exists() else sys.executable
     return str(ENV_PYTHON) if ENV_PYTHON.exists() else sys.executable
 
-# name -> extra train.py CLI args (on top of champion defaults: rank=4 alpha=8 layers=8
-# rys=4-8 head=direct backbone=esmif1). One axis varied at a time.
-CONFIGS: dict[str, list[str]] = {
+# One training axis varied at a time (on top of the champion defaults in train.py's TrainConfig:
+# rank=4 alpha=8 layers=8 rys=4-8 head=direct backbone=esmif1) -- each name below is a
+# configs/<name>.yaml passed to train.py via --config.
+CONFIG_NAMES: list[str] = [
     # -- LoRA rank (alpha scaled 2x rank, matching the champion's own 4/8 ratio) --
-    "lora_rank2_alpha4":  ["--lora-rank", "2", "--lora-alpha", "4"],
-    "lora_rank8_alpha16": ["--lora-rank", "8", "--lora-alpha", "16"],
-    "lora_rank16_alpha32": ["--lora-rank", "16", "--lora-alpha", "32"],
+    "lora_rank2_alpha4", "lora_rank8_alpha16", "lora_rank16_alpha32",
     # -- LoRA layer count (how many top encoder layers get adapters) --
-    "lora_layers2": ["--lora-layers", "2"],
-    "lora_layers4": ["--lora-layers", "4"],
-    "lora_layers6": ["--lora-layers", "6"],
+    "lora_layers2", "lora_layers4", "lora_layers6",
     # -- RYS replay window (encoder has 8 layers total) --
-    "rys_none":     ["--rys-start", "8", "--rys-end", "8"],
-    "rys_all":      ["--rys-start", "0", "--rys-end", "8"],
-    "rys_last2":    ["--rys-start", "6", "--rys-end", "8"],
-    "rys_last6":    ["--rys-start", "2", "--rys-end", "8"],
+    "rys_none", "rys_all", "rys_last2", "rys_last6",
     # -- head MLP dimension (default: direct Linear(512,1), the champion) --
-    "head_dim128":  ["--head-dim", "128"],
-    "head_dim256":  ["--head-dim", "256"],
-    "head_dim1024": ["--head-dim", "1024"],
+    "head_dim128", "head_dim256", "head_dim1024",
     # -- head/MLP dropout (default: 0.1, the champion -- see baseline row) --
-    "dropout_0.2": ["--dropout", "0.2"],
-    "dropout_0.3": ["--dropout", "0.3"],
-    "dropout_0.4": ["--dropout", "0.4"],
+    "dropout_0.2", "dropout_0.3", "dropout_0.4",
     # -- pretrained backbone (sequence-only ESM2/ESM3 vs. structure ESM-IF1) --
-    "backbone_esm2_35M":  ["--backbone", "esm2", "--esm2-size", "35M"],
-    "backbone_esm2_150M": ["--backbone", "esm2", "--esm2-size", "150M"],
-    "backbone_esm2_650M": ["--backbone", "esm2", "--esm2-size", "650M"],
-    "backbone_esm3":      ["--backbone", "esm3"],
-}
+    "backbone_esm2_35M", "backbone_esm2_150M", "backbone_esm2_650M", "backbone_esm3",
+]
 
 CSV_FIELDS = ["config", "fold", "val_auc", *[f"test_auc_{b}" for b in BENCHMARKS],
               "steps", "seconds", "status"]
@@ -102,9 +99,8 @@ def run_job(config_name: str, fold: int, gpu_id: int, args, csv_lock, csv_path) 
 
     cmd = [python_for(config_name), str(TRAIN_PY),
            "--fasta", str(args.dataset.resolve()), "--structures", str(args.structures.resolve()),
-           "--fold", str(fold), "--out", str(out),
-           "--max-seconds", str(args.max_seconds), "--seed", str(args.seed),
-           *CONFIGS[config_name]]
+           "--fold", str(fold), "--out", str(out), "--config", str(config_path(config_name)),
+           "--max-seconds", str(args.max_seconds), "--seed", str(args.seed)]
     full_env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
 
     print(f"[{config_name} fold={fold} gpu={gpu_id}] starting -> {log_path}", flush=True)
@@ -200,7 +196,7 @@ def main() -> None:
     p.add_argument("--max-seconds", type=int, default=1800)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--folds", type=int, nargs="+", default=list(FOLDS))
-    p.add_argument("--configs", nargs="+", default=None, choices=list(CONFIGS),
+    p.add_argument("--configs", nargs="+", default=None, choices=CONFIG_NAMES,
                    help="override config list (default: all)")
     p.add_argument("--n-workers", type=int, default=None)
     p.add_argument("--summarize-only", action="store_true")
@@ -210,7 +206,7 @@ def main() -> None:
         summarize(args.results, args.ablation_results)
         return
 
-    configs = args.configs or list(CONFIGS)
+    configs = args.configs or list(CONFIG_NAMES)
     args.weights_dir.mkdir(parents=True, exist_ok=True)
     args.log_dir.mkdir(parents=True, exist_ok=True)
     n_workers = args.n_workers or gpu_count()
