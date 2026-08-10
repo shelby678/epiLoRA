@@ -3,40 +3,29 @@
 Training data is a FASTA of antigen sequences (as produced by
 ``data/data_prep.smk``) plus their mmCIF structures.
 
-FASTA format (one record per antigen, one or more chains)::
-
-    >pdb_000010bt-A-E 2026/01/10 1.99 I|J homo_sapiens homo_sapiens n=3 4.0
-    ...ndklKRELtnkgqvADIYWL...
-
-  * header fields (space-separated): ``instance``, ``date``, ``resolution``,
-    ``antigen_chain`` (``|``-joined if the antigen spans multiple chains),
-    ``heavy_species``, ``light_species``, ``n=<qualifying members>``,
-    ``fold_label``.
-  * ``instance`` starts with the PDB id (``pdb_XXXXXXXX``); the structure
-    lives at ``<structures_dir>/<pdb_id>/<pdb_id>_sabdab.cif``.
-  * sequence casing encodes the label: lowercase = epitope residue,
-    UPPERCASE = non-epitope.
-  * ``fold_label`` is ``{i}.{j}`` from the 5-fold CV scheme: ``i`` (1-5) is
-    the cross-validation fold, ``j`` is that fold's role (``0`` = val/eval,
-    ``1`` = test). See ``data/README.md``.
-
-Only sequences whose structure is found (and whose residue count matches the
-sequence, chains concatenated in the header's order) are usable — ESM-IF1
-needs backbone coordinates.
+Every entry's structure file must be present under ``structures_dir``; only
+whether its residue count matches the sequence (chains concatenated in the
+header's order) is tolerated as a per-entry skip — ESM-IF1 needs backbone
+coordinates.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # A training example: (header, sequence, per-residue labels, backbone coords|None)
 Sample = tuple
 
 
 def parse_fasta(path: Path) -> dict[str, list]:
-    """Parse the labelled FASTA into {fold_label: [(header, seq, labels), ...]}."""
+    """Parses labelled fasta sequences and labels by fold (e.g. 1.0, 1.1, 2.0, etc.)
+    Returns a dict of format {fold_label: [(header, seq, labels), ...]}
+    """
     by_part: dict[str, list] = {}
 
     def add(header: str, seq: str) -> None:
@@ -58,13 +47,13 @@ def parse_fasta(path: Path) -> dict[str, list]:
 
 
 def parse_seq_id(header: str):
-    """Return (pdb_id, [chain, ...]) from a header, or None if it can't be parsed."""
+    """Return (pdb_id, [chain, ...]) from a header."""
     fields = header.split()
     if len(fields) < 4:
-        return None
+        raise ValueError(f"malformed header (expected >=4 fields): {header!r}")
     instance = fields[0]
     if not instance.startswith("pdb_"):
-        return None
+        raise ValueError(f"malformed header (instance must start with 'pdb_'): {header!r}")
     pdb_id = instance[:len("pdb_") + 8]  # "pdb_" + 8-char PDB code
     chains = fields[3].split("|")
     return pdb_id, chains
@@ -72,17 +61,22 @@ def parse_seq_id(header: str):
 
 def load_backbone_coords(cif_path: Path, chain_ids: list[str], seq_len: int):
     """Load (seq_len, 3, 3) N/CA/C coords for ``chain_ids`` (concatenated in
-    order); None on mismatch."""
+    order); None if the CIF can't be parsed, a chain is missing, or the
+    residue count doesn't match ``seq_len`` -- every failure mode is treated
+    the same way (skip + log a warning) so one bad structure file can't crash
+    an entire training run the way the others are silently skipped."""
     from Bio.PDB import MMCIFParser
     from Bio.PDB.Polypeptide import is_aa
     try:
-        model = next(iter(MMCIFParser(QUIET=True).get_structure("x", str(cif_path))))
-    except Exception:
+        model = next(iter(MMCIFParser(QUIET=True).get_structure("x", str(cif_path)))) # get the model
+    except Exception as e:
+        logger.warning(f"could not parse structure at {cif_path}: {e}")
         return None
 
     residues = []
     for chain_id in chain_ids:
         if chain_id not in model:
+            logger.warning(f"chain {chain_id!r} not in model at {cif_path}")
             return None
         residues.extend(res for res in model[chain_id] if is_aa(res, standard=True))
     if len(residues) != seq_len:
@@ -101,12 +95,10 @@ def load_samples(entries: list, structures_dir: Path) -> list:
     structures_dir = Path(structures_dir)
     out = []
     for header, seq, labels in entries:
-        parsed = parse_seq_id(header)
-        coords = None
-        if parsed:
-            pdb_id, chains = parsed
-            cp = structures_dir / pdb_id / f"{pdb_id}_sabdab.cif"
-            if cp.exists():
-                coords = load_backbone_coords(cp, chains, len(seq))
+        pdb_id, chains = parse_seq_id(header)
+        cp = structures_dir / pdb_id / f"{pdb_id}_sabdab.cif"
+        if not cp.exists():
+            raise FileNotFoundError(f"no structure file for {header!r}: {cp}")
+        coords = load_backbone_coords(cp, chains, len(seq))
         out.append((header, seq, labels, coords))
     return out
