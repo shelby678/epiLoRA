@@ -1,6 +1,7 @@
 """Evaluate a trained checkpoint (any backbone, or an ensemble of several) on
-data/results/eval.fasta -- the final held-out benchmark, distinct from the CV
-folds used during the ablation sweep -- and report per-residue ROC-AUC.
+data/train_test_eval/eval/allowed_species_homo_sapiens_min_resolution_5_epitopes.fasta
+-- the final held-out benchmark, distinct from the CV folds used during the
+ablation sweep -- and report per-residue ROC-AUC.
 
     python eval_final.py --weights weights/champion.pt
     python eval_final.py --weights weights/ensemble/*_seed42.pt weights/ensemble/*_seed43.pt --out preds.csv
@@ -11,7 +12,7 @@ these predictions can be lined up against DiscoTope 3.0's own per-residue
 scores on the same antigens.
 
 Must be run with epilora/env/bin/python3 for esmif1/esm2 checkpoints, or
-epilora/env_esm3/bin/python3 for esm3 checkpoints (see predict.load_model).
+epilora/env_esm3/bin/python3 for esm3/esmc checkpoints (see predict.load_model).
 """
 from __future__ import annotations
 
@@ -31,23 +32,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 @torch.no_grad()
 def predict_all(models, samples, device):
-    """Return (headers, seqs, labels_list, probs_list) for structure-backed samples,
-    ``probs_list[i]`` averaged sigmoid across ``models`` for sample i."""
+    """Return (headers, seqs, labels_list, probs_list) -- ``probs_list[i]``
+    averaged sigmoid across ``models`` for sample i."""
     headers, seqs, labels_list, probs_list = [], [], [], []
     for header, seq, labels, coords in samples:
         if coords is None:
-            continue
-        per_model = []
-        ok = True
-        for m in models:
-            try:
-                logits = m([coords], [seq])[0].cpu().numpy()
-            except Exception:
-                ok = False
-                break
-            per_model.append(1.0 / (1.0 + np.exp(-logits)))
-        if not ok:
-            continue
+            raise ValueError(f"no usable backbone coordinates for {header!r} -- "
+                             "every eval-set antigen must be scorable for a fair comparison")
+        per_model = [1.0 / (1.0 + np.exp(-m([coords], [seq])[0].cpu().numpy())) for m in models]
         headers.append(header)
         seqs.append(seq)
         labels_list.append(labels)
@@ -60,7 +52,8 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--weights", type=Path, nargs="+", required=True,
                    help="one checkpoint (single model) or several (ensemble average)")
-    p.add_argument("--eval-fasta", type=Path, default=REPO_ROOT / "data/results/eval.fasta")
+    p.add_argument("--eval-fasta", type=Path, default=REPO_ROOT /
+                   "data/train_test_eval/eval/allowed_species_homo_sapiens_min_resolution_5_epitopes.fasta")
     p.add_argument("--structures", type=Path, default=REPO_ROOT / "data/raw/all-structures-extracted")
     p.add_argument("--out", type=Path, default=None, help="optional per-residue CSV output")
     args = p.parse_args()
@@ -75,9 +68,12 @@ def main() -> None:
     print(f"eval.fasta: {len(entries)} records, {n_struct} with usable structure")
 
     headers, seqs, labels_list, probs_list = predict_all(models, samples, device)
-    y = np.concatenate(labels_list)
-    s = np.concatenate(probs_list)
-    auc = roc_auc_score(y, s) if len(np.unique(y)) >= 2 else float("nan")
+    if labels_list:
+        y = np.concatenate(labels_list)
+        s = np.concatenate(probs_list)
+        auc = roc_auc_score(y, s) if len(np.unique(y)) >= 2 else float("nan")
+    else:
+        y, auc = np.array([]), float("nan")
     print(f"n_models={len(models)}  n_residues={len(y)}  n_antigens={len(headers)}  ROC-AUC={auc:.4f}")
 
     if args.out is not None:
