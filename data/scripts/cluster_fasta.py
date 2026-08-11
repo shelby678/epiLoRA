@@ -13,7 +13,6 @@ Each member carries its own antigen_chains (rather than only the cluster header
 carrying the representative's) so that combine_epitopes.py can elect a different
 member as backbone without stranding it with the wrong PDB entry's chain IDs.
 """
-import os
 import random
 import subprocess
 import sys
@@ -23,7 +22,7 @@ from pathlib import Path
 # usage: cluster_fasta.py <in_fasta> <out_fasta> <log_path>
 in_fasta, out_fasta, log_path = sys.argv[1:4]
 MIN_SEQ_ID = 0.95  # mmseqs2 clustering identity threshold
-MMSEQS = os.path.expanduser("~/work/env/bin/mmseqs")
+MMSEQS = "mmseqs"  # assumed on PATH in the active env
 
 random.seed(0)
 # 5-fold CV labels, each fold split into two halves -> one label assigned per cluster

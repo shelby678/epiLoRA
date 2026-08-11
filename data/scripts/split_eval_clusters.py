@@ -8,7 +8,6 @@ being discarded -- reclaiming its data rather than wasting it. Since growing the
 can turn a previously-safe eval cluster newly unsafe, this repeats (mmseqs easy-search,
 reclaim, repeat) until a full pass finds nothing left to reclaim.
 """
-import os
 import subprocess
 import sys
 import tempfile
@@ -18,7 +17,7 @@ from pathlib import Path
 in_clusters, eval_out, train_out, log_path, cutoff_date_str = sys.argv[1:6]
 CUTOFF = date.fromisoformat(cutoff_date_str)
 MIN_SIMILARITY = 0.40
-MMSEQS = os.path.expanduser("~/work/env/bin/mmseqs")
+MMSEQS = "mmseqs"  # assumed on PATH in the active env
 
 
 def parse_clusters(path):
