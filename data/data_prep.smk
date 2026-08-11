@@ -90,6 +90,12 @@ This is prepartion for data ablation, in which  we filter the clusters according
 we're testing and combine epitope markers into one representative sequence, i.e. if this residue is marked as epitope
 in some seq in the cluster, mark it as epitope in the rep.
 
+Fold labels are NOT drawn independently per cluster: cluster_fasta.py also clusters the 95%
+representatives again at a much looser 40% identity, purely to decide which of the 5 CV groups
+(the `i` in a `i.j` fold label) a cluster is confined to. Two 95%-clusters that are themselves
+distinct epitope entries, but are near-duplicates of each other at 40% identity, always end up
+in the same CV group and so won't be split across train/eval for any CV run
+
     >>CLUSTER {rep_instance} {fold_label}
     >{instance} {date} {resolution} {antigen_chains} {heavy_species} {light_species}
     {seq aligned to the cluster's shared frame, '-' where this member has no residue at that column}

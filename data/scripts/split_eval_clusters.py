@@ -17,6 +17,12 @@ from pathlib import Path
 in_clusters, eval_out, train_out, log_path, cutoff_date_str = sys.argv[1:6]
 CUTOFF = date.fromisoformat(cutoff_date_str)
 MIN_SIMILARITY = 0.40
+# See cluster_fasta.py's MIN_COV/COV_MODE comment: default mmseqs2 coverage requires both
+# sequences to be ~80% covered, which misses a short eval fragment that's fully contained in a
+# much longer train sequence (or vice versa). --cov-mode 5 requires only the shorter sequence of
+# the pair to meet MIN_COV, so those fragment/full-length duplicates get caught here too.
+MIN_COV = 0.3
+COV_MODE = 5
 MMSEQS = "mmseqs"  # assumed on PATH in the active env
 
 
@@ -70,7 +76,7 @@ def flagged_eval_cluster_indices(eval_clusters, train_clusters, tmp):
     result_m8 = tmp / "result.m8"
     subprocess.run(
         [MMSEQS, "easy-search", str(eval_fasta), str(train_fasta), str(result_m8), str(tmp / "work"),
-         "--min-seq-id", str(MIN_SIMILARITY)],
+         "--min-seq-id", str(MIN_SIMILARITY), "-c", str(MIN_COV), "--cov-mode", str(COV_MODE)],
         check=True, capture_output=True, text=True,
     )
     flagged = set()
