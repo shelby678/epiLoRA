@@ -13,6 +13,7 @@
 # --- job ---
 #SBATCH --job-name=epi_ablation
 #SBATCH --partition=hpc-mid,hpc-low
+#SBATCH --requeue
 
 # --- resources ---
 #SBATCH --gres=gpu:1
@@ -23,6 +24,7 @@
 # --- logs ---
 #SBATCH --output=/mnt/home/%u/logs/%x_%A.out
 #SBATCH --error=/mnt/home/%u/logs/%x_%A.err
+#SBATCH --open-mode=append
 
 # --- container ---
 #SBATCH --container-image=/mnt/data/containers/deeplearning_v2026-05-26.sqsh
@@ -58,8 +60,8 @@ WANDB_ARGS=()
 if [[ "${WANDB:-0}" == "1" ]]; then
     # SLURM_JOB_ID is always set here (this *is* the Slurm job), so the run name
     # always gets a job-id suffix -- distinguishes reruns/requeues of the same job.
-    WANDB_ARGS=(--wandb --wandb-project "$WANDB_PROJECT" \
-                --wandb-run-name "${WANDB_RUN_NAME}${SLURM_JOB_ID:+_$SLURM_JOB_ID}")
+    RUN_NAME="${WANDB_RUN_NAME}${SLURM_JOB_ID:+_$SLURM_JOB_ID}${SLURM_RESTART_COUNT:+_r$SLURM_RESTART_COUNT}"
+    WANDB_ARGS=(--wandb --wandb-project "$WANDB_PROJECT" --wandb-run-name "$RUN_NAME")
 fi
 
 # train
