@@ -3,9 +3,6 @@
 Per-residue **B-cell epitope prediction** on antigen structures with the
 best-performing model from the epiLoRA study: **ESM-IF1 + LoRA + RYS**.
 
-- **5-fold ROC-AUC: 0.824 ± 0.064** (pooled 0.833) — ahead of an ESM3 LoRA
-  model (~0.71), ESM2 (~0.67), and a DiscoTope-style XGBoost recipe (~0.75).
-
 ESM-IF1 is an inverse-folding model, so it reads protein **backbone geometry**:
 the frozen ESM-IF1 GVP-Transformer encoder is adapted with **LoRA** on its
 attention projections, its top encoder layers are replayed once (**RYS** =
@@ -22,7 +19,7 @@ predict.py          run a trained checkpoint on a PDB -> per-residue scores
 ablation/           run_ablation.py -- 5-fold CV sweep across data ablations
 requirements.txt    pinned dependencies (Python 3.9)
 weights/            trained checkpoints go here (not committed) — see weights/README.md
-data/               your training data goes here (not committed) — see data/README.md
+data/               train/test/eval set generation from raw datasets (sabdab)
 ```
 
 ## Install
