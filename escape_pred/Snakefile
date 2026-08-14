@@ -1,0 +1,165 @@
+# Snakefile: whole pipeline from metadata → phylogenetic tree → escape prediction
+#
+# Usage:
+#   snakemake --cores 8                    # run everything with defaults
+#   snakemake --cores 8 --config n_samples=50000  # override parameters
+#   snakemake --cores 8 --configfile config.yaml   # load config from file
+#
+# Config (all overridable via --config key=value):
+#   n_samples      Number of genomes to subsample (default: 30000)
+#   n_selected     Number of top-selected mutations (default: 100)
+#   n_median       Number of median-selected mutations (default: 100)
+#   n_least        Number of least-selected mutations (default: 100)
+#   weights        Path to epiLoRA ESM2 checkpoint
+#   epilora_env    Python env for epiLoRA (must have torch + ESM2)
+#   phylo_env      Conda env with UShER + matUtils
+#   metadata       Path to Nextclade metadata.tsv
+#   reference      Path to NC_045512.2 FASTA
+
+# ---- Config ----
+config.setdefault("n_samples", 30000)
+config.setdefault("n_selected", 100)
+config.setdefault("n_median", 100)
+config.setdefault("n_least", 100)
+config.setdefault("weights", "/home/jovyan/work/epiLoRA/weights/ablation/all_fold2_esm2.pt")
+config.setdefault("epilora_env", "/home/jovyan/work/epiLoRA/epilora/env/bin/python")
+config.setdefault("phylo_env", "phylo")
+config.setdefault("metadata", "data/sars-cov2/metadata.tsv")
+config.setdefault("reference", "data/sars-cov2/NC_045512.2.fasta")
+
+PHYLO_PY = "python3"
+EPILORA_PY = config["epilora_env"]
+
+# ---- Paths ----
+WORK = "work"
+RESULTS = "results"
+SCRIPTS = "scripts"
+
+# ---- Rules ----
+
+rule all:
+    input:
+        f"{RESULTS}/descendants_plot.png",
+        f"{RESULTS}/descendants.tsv",
+        f"{RESULTS}/selected_mutants.fasta",
+        f"{RESULTS}/median_mutants.fasta",
+        f"{RESULTS}/least_mutants.fasta",
+        f"{RESULTS}/escape_eval.tsv",
+        f"{RESULTS}/escape_eval_plot.png",
+        f"{RESULTS}/escape_aa_scan.png",
+    message: "Pipeline complete. See results/ for all outputs."
+
+# ---- 1. Prepare data: metadata → VCF + starting tree ----
+rule prepare_data:
+    input:
+        metadata = config["metadata"],
+        reference = config["reference"],
+    output:
+        vcf      = f"{WORK}/samples.vcf",
+        tree     = f"{WORK}/start_tree.nwk",
+        subsample= f"{WORK}/subsample.tsv",
+    params:
+        n_samples = config["n_samples"],
+        outdir    = WORK,
+    shell:
+        "{PHYLO_PY} {SCRIPTS}/prepare_data.py"
+        "  --metadata {input.metadata}"
+        "  --reference {input.reference}"
+        "  --outdir {params.outdir}"
+        "  --n-samples {params.n_samples}"
+
+# ---- 2. UShER: build mutation-annotated tree ----
+rule run_usher:
+    input:
+        vcf  = rules.prepare_data.output.vcf,
+        tree = rules.prepare_data.output.tree,
+    output:
+        mat  = f"{WORK}/tree.mat.pb",
+        json = f"{WORK}/tree.json",
+    shell:
+        "mamba run -n {config[phylo_env]} usher"
+        "  -v {input.vcf}"
+        "  -t {input.tree}"
+        "  -o {output.mat}"
+        "  -d {WORK} 2>&1 | grep -v '^At variant site' | tail -20"
+        " && mamba run -n {config[phylo_env]} matUtils extract"
+        "  -i {output.mat}"
+        "  -j {output.json} 2>&1 | tail -5"
+
+# ---- 3. Count descendants & plot ----
+rule count_and_plot:
+    input:
+        json   = rules.run_usher.output.json,
+        sub    = rules.prepare_data.output.subsample,
+        ref    = config["reference"],
+    output:
+        plot   = f"{RESULTS}/descendants_plot.png",
+        tsv    = f"{RESULTS}/descendants.tsv",
+        top    = f"{RESULTS}/top_mutations.tsv",
+    shell:
+        "{PHYLO_PY} {SCRIPTS}/count_and_plot.py"
+        "  --json {input.json}"
+        "  --subsample {input.sub}"
+        "  --ref {input.ref}"
+        "  --outdir {RESULTS}"
+        "  --top 50"
+
+# ---- 4. Extract ancestor genomes ----
+rule extract_ancestors:
+    input:
+        json     = rules.run_usher.output.json,
+        sub      = rules.prepare_data.output.subsample,
+        ref      = config["reference"],
+    output:
+        selected = f"{RESULTS}/selected_mutants.fasta",
+        median   = f"{RESULTS}/median_mutants.fasta",
+        least    = f"{RESULTS}/least_mutants.fasta",
+        summary  = f"{RESULTS}/ancestor_mutations.tsv",
+    params:
+        n_selected = config["n_selected"],
+        n_median = config["n_median"],
+        n_least  = config["n_least"],
+    shell:
+        "{PHYLO_PY} {SCRIPTS}/extract_ancestors.py"
+        "  --json {input.json}"
+        "  --subsample {input.sub}"
+        "  --ref {input.ref}"
+        "  --outdir {RESULTS}"
+        "  --n-selected {params.n_selected}"
+        "  --n-median {params.n_median}"
+        "  --n-least {params.n_least}"
+
+# ---- 5. epiLoRA escape evaluation ----
+rule escape_eval:
+    input:
+        selected = rules.extract_ancestors.output.selected,
+        median   = rules.extract_ancestors.output.median,
+        least    = rules.extract_ancestors.output.least,
+        weights  = config["weights"],
+    output:
+        tsv      = f"{RESULTS}/escape_eval.tsv",
+        plot     = f"{RESULTS}/escape_eval_plot.png",
+    shell:
+        "{EPILORA_PY} {SCRIPTS}/run_escape_eval.py"
+        "  --results-dir {RESULTS}"
+        "  --weights {input.weights}"
+        "  --out {output.tsv}"
+        "  --out-plot {output.plot}"
+
+# ---- 6. Amino acid scan for post-April-2021 escape mutations ----
+rule escape_aa_scan:
+    input:
+        selected = rules.extract_ancestors.output.selected,
+        median   = rules.extract_ancestors.output.median,
+        least    = rules.extract_ancestors.output.least,
+        sub      = rules.prepare_data.output.subsample,
+        weights  = config["weights"],
+    output:
+        plot = f"{RESULTS}/escape_aa_scan.png",
+        tsv  = f"{RESULTS}/escape_aa_scan.tsv",
+    shell:
+        "{EPILORA_PY} {SCRIPTS}/escape_aa_scan.py"
+        "  --results-dir {RESULTS}"
+        "  --subsample {input.sub}"
+        "  --weights {input.weights}"
+        "  --out-plot {output.plot}"
