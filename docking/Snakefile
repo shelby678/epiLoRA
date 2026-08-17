@@ -1,0 +1,195 @@
+import glob
+import os
+
+EXPORT_DIR  = "input_pdbs"
+REF_PDB_DIR = "input_pdbs/selected_32_pdbs"
+
+DNAMES_WITH_REF = {
+    os.path.splitext(os.path.basename(f))[0]
+    for f in glob.glob(f"{REF_PDB_DIR}/*.pdb")
+}
+
+# ─── Discover all (dname, ab_stem, ag_stem) combinations ─────────────────────
+RUNS = []
+for _d in sorted(glob.glob(f"{EXPORT_DIR}/????")):
+    _dname   = os.path.basename(_d)
+    _ab_pdbs = sorted(glob.glob(f"{_d}/ab*.pdb"))
+    _ag_pdbs = sorted(glob.glob(f"{_d}/ag*.pdb"))
+    for _ab in _ab_pdbs:
+        for _ag in _ag_pdbs:
+            RUNS.append((
+                _dname,
+                os.path.splitext(os.path.basename(_ab))[0],
+                os.path.splitext(os.path.basename(_ag))[0],
+            ))
+
+if RUNS:
+    _z = list(zip(*RUNS))
+    DNAMES, ABSTEMS, AGSTEMS = list(_z[0]), list(_z[1]), list(_z[2])
+else:
+    raise Exception("input pdbs not found")
+
+
+#####################################################################
+
+ALL_DONE = expand(
+    "runs/{dname}/{ab}_vs_{ag}/done",
+    zip,
+    dname=DNAMES,
+    ab=ABSTEMS,
+    ag=AGSTEMS,
+)
+
+
+rule all:
+    input:
+        ALL_DONE,
+        "capri_results.csv",
+        "rmsd_results.csv",
+
+
+rule prepare_pdbs:
+    """Make the heavy and light chain of the antibody one chain (chain B). Make the antigen chain A and remove any part that isn't protein."""
+    input:
+        ab = lambda wc: f"{EXPORT_DIR}/{wc.dname}/{wc.ab}.pdb",
+        ag = lambda wc: f"{EXPORT_DIR}/{wc.dname}/{wc.ag}.pdb",
+    output:
+        ab = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+    log:
+        "logs/{dname}/prepare_pdbs_{ab}_vs_{ag}.log"
+    shell:
+        "/opt/conda/bin/python scripts/prepare_pdbs.py"
+        " --antibody {input.ab} --antigen {input.ag}"
+        " --out-ab {output.ab} --out-ag {output.ag}"
+        " > {log} 2>&1"
+
+
+rule prepare_reference:
+    """Build a caprieval-ready reference from the experimentally determined complex."""
+    input:
+        fv_ab = lambda wc: f"{EXPORT_DIR}/{wc.dname}/ab_1.pdb",
+        ref   = lambda wc: f"{REF_PDB_DIR}/{wc.dname}.pdb",
+    output:
+        ref = "runs/{dname}/reference.pdb",
+    log:
+        "logs/{dname}/prepare_reference.log"
+    shell:
+        "/opt/conda/bin/python scripts/prepare_reference.py"
+        " --fv-ab {input.fv_ab} --ref {input.ref}"
+        " --out {output.ref}"
+        " > {log} 2>&1"
+
+
+rule generate_restraints:
+    """Generate CDR-based ambiguous and VH-VL unambiguous restraints.
+
+    Antigen passive residues are epiLoRA-constrained: surface (haddock3-
+    restraints calc_accessibility) intersected with cache/epitope/{dname}_{ag}.csv
+    residues at prob > 0.20 (precomputed once by stage_antigens.py ->
+    dump_residue_keys.py -> predict_ensemble.py -> build_epitope_cache.py,
+    since epiLoRA needs the epilora/env torch+esm stack this pipeline's
+    python doesn't have)."""
+    input:
+        ab      = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag      = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+        epitope = "cache/epitope/{dname}_{ag}.csv",
+    output:
+        ambig   = "runs/{dname}/{ab}_vs_{ag}/ambig.tbl",
+        unambig = "runs/{dname}/{ab}_vs_{ag}/unambig.tbl",
+    log:
+        "logs/{dname}/generate_restraints_{ab}_vs_{ag}.log"
+    shell:
+        "/opt/conda/bin/python scripts/generate_restraints.py"
+        " --ab {input.ab} --ag {input.ag}"
+        " --epitope-csv {input.epitope} --epitope-threshold 0.20"
+        " --ambig {output.ambig} --unambig {output.unambig}"
+        " > {log} 2>&1"
+
+
+rule haddock_config:
+    """Generate a HADDOCK3 TOML config for one antibody-antigen pair."""
+    input:
+        ab      = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag      = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+        ambig   = "runs/{dname}/{ab}_vs_{ag}/ambig.tbl",
+        unambig = "runs/{dname}/{ab}_vs_{ag}/unambig.tbl",
+        ref     = lambda wc: (
+            [f"runs/{wc.dname}/reference.pdb"] if wc.dname in DNAMES_WITH_REF else []
+        ),
+        template = "template.cfg",
+    output:
+        cfg = "runs/{dname}/{ab}_vs_{ag}/run.toml",
+    log:
+        "logs/{dname}/haddock_config_{ab}_vs_{ag}.log"
+    params:
+        ref_arg = lambda wc, input: input.ref[0] if input.ref else "",
+    shell:
+        "bash scripts/make_haddock_config.sh"
+        " {input.template} {input.ab} {input.ag}"
+        " {input.ambig} {input.unambig}"
+        " {output.cfg} {params.ref_arg}"
+        " > {log} 2>&1"
+
+
+rule run_haddock:
+    """Run HADDOCK3 docking pipeline for one antibody-antigen pair."""
+    input:
+        cfg     = "runs/{dname}/{ab}_vs_{ag}/run.toml",
+        ab      = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag      = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+        ambig   = "runs/{dname}/{ab}_vs_{ag}/ambig.tbl",
+        unambig = "runs/{dname}/{ab}_vs_{ag}/unambig.tbl",
+    output:
+        done = "runs/{dname}/{ab}_vs_{ag}/done",
+    log:
+        "logs/{dname}/{ab}_vs_{ag}.log",
+    threads: 1
+    params:
+        restart = 0,
+        rts     = "+RTS -N1 -A64m -RTS",
+    shell:
+        """
+        env/bin/haddock3 {input.cfg} --restart {params.restart} > {log} 2>&1
+        touch {output.done}
+        """
+
+
+rule capri_analysis:
+    """Recompute CAPRI quality metrics (lRMSD, iRMSD, fnat, DockQ) for every
+    cluster model of every completed run, by aligning directly against the
+    crystal structure. Independent of HADDOCK3's own caprieval, so it covers
+    every dname (not just DNAMES_WITH_REF)."""
+    input:
+        done = ALL_DONE,
+    output:
+        csv  = "capri_results.csv",
+        plot = "capri_plot.png",
+    log:
+        "logs/capri_analysis.log"
+    shell:
+        "/opt/conda/bin/python scripts/capri_analysis.py"
+        " --runs-dir runs --crystal-dir {REF_PDB_DIR}"
+        " --ab-dir {EXPORT_DIR} --ag-dir {EXPORT_DIR}"
+        " --out-csv {output.csv} --out-plot {output.plot}"
+        " > {log} 2>&1"
+
+
+rule compute_rmsd:
+    """Collect HADDOCK3's own caprieval metrics (11_caprieval/capri_ss.tsv,
+    capri_clt.tsv) for every completed run -- a cross-check against the
+    independent recomputation in capri_analysis. Only meaningful for dnames
+    with a runs/{{dname}}/reference.pdb (DNAMES_WITH_REF), since that's the
+    reference caprieval scored against."""
+    input:
+        done = ALL_DONE,
+    output:
+        csv     = "rmsd_results.csv",
+        summary = "rmsd_summary.csv",
+    log:
+        "logs/compute_rmsd.log"
+    shell:
+        "/opt/conda/bin/python scripts/compute_rmsd.py"
+        " --runs-dir runs"
+        " --out {output.csv} --summary-out {output.summary}"
+        " > {log} 2>&1"
