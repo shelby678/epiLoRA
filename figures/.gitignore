@@ -1,0 +1,4 @@
+ebola/
+results/
+db/
+.snakemake/
