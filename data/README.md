@@ -57,3 +57,13 @@ choice, reproducible):
 
 So for CV fold `i`, clusters labeled `i.0` are its eval set, `i.1` are its
 test set, and everything else is training data for that fold.
+
+## Analysis scripts
+
+`scripts/pct_non_epitope_surface_hist.py` histograms, per antigen in
+`train_test_eval/all_epitopes.fasta`, what percent of its *surface* residues
+are non-epitope (UPPERCASE). Surface accessibility comes from freesasa
+(default Shrake-Rupley parameters, default classifier -- antigen chain(s)
+only, antibody excluded) with a residue called "surface" at relative SASA
+>= 0.20, the same cutoff used by `benchmarking/discotope3` and
+`benchmarking/webtools/ispred4`.
