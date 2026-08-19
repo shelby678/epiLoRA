@@ -458,3 +458,91 @@ def build_model_esmc(device: str = "cpu", size: str = "600M", rank: int = 4, alp
     model = ESMCEpitopeModel(esm_model, size=size, rank=rank, alpha=alpha,
                              n_lora_layers=n_lora_layers, dropout=dropout, head_dim=head_dim).to(device)
     return model
+
+
+# ==== ProstT5 backbone (sequence-only) ======================================
+#
+# ProstT5 (Rostlab/ProstT5) is a T5 encoder-decoder pretrained on AA<->3Di
+# "translation"; we only ever use its encoder in AA2fold direction as a
+# sequence-only protein embedder (no backbone coordinates used), same
+# ablation role as ESM2/ESM3/ESMc. Reconstructed from a checkpoint's saved
+# config -- ``{'name': 'Rostlab/ProstT5', 'rank': 4, 'alpha': 8.0,
+# 'n_lora_layers': 8, 'dropout': ..., 'head_dim': None}`` -- and the
+# checkpoint's trainable-state key names (``t5.encoder.block.{16..23}.layer.0.
+# SelfAttention.{q,k,v,o}.lora_{A,B}``, ``head_ln.*``, ``head.*``): this repo's
+# own training code for this backbone was never committed, so this follows
+# Rostlab's documented ProstT5 usage (github.com/mheinzinger/ProstT5) --
+# uppercase sequence, rare AAs (U,Z,O,B) mapped to X, space-joined characters,
+# "<AA2fold>" direction-prefix token -- rather than a from-scratch guess.
+
+PROSTT5_HIDDEN = 1024
+PROSTT5_N_LAYERS = 24
+
+
+def inject_lora_t5(blocks, rank: int, alpha: float, n_layers: int) -> None:
+    """Add LoRA adapters to q/k/v/o of the last ``n_layers`` T5 encoder blocks.
+
+    ``blocks`` is a T5Stack's ``.block`` ModuleList; each block's self-attention
+    lives at ``block[i].layer[0].SelfAttention`` with separate q/k/v/o Linears
+    (T5's own layout, unlike fair-esm's fused-vs-separate variants above).
+    """
+    total = len(blocks)
+    start = max(0, total - n_layers)
+    for i in range(start, total):
+        attn = blocks[i].layer[0].SelfAttention
+        for name in ("q", "k", "v", "o"):
+            setattr(attn, name, LoRALinear(getattr(attn, name), rank, alpha))
+
+
+class ProstT5EpitopeModel(EpitopeModel):
+    """Frozen ProstT5 encoder (AA2fold direction) + LoRA + per-residue epitope head."""
+
+    def __init__(self, t5_model, tokenizer, name: str = "Rostlab/ProstT5",
+                 rank: int = 4, alpha: float = 8.0, n_lora_layers: int = 8,
+                 dropout: float = 0.1, head_dim: int | None = None):
+        super().__init__()
+        self.t5 = t5_model
+        self.tokenizer = tokenizer
+        self._cfg = dict(name=name, rank=rank, alpha=alpha, n_lora_layers=n_lora_layers,
+                         dropout=dropout, head_dim=head_dim)
+        for p in self.t5.parameters():
+            p.requires_grad = False
+        inject_lora_t5(self.t5.encoder.block, rank, alpha, n_lora_layers)
+        self._init_head(PROSTT5_HIDDEN, dropout, head_dim)
+
+    def _encode(self, coords_batch, seq_batch):
+        """``coords_batch`` is accepted (for interface parity with the ESM-IF1
+        model) but ignored -- ProstT5 here is sequence-only.
+
+        Sequences are uppercased, rare amino acids (U,Z,O,B) mapped to X,
+        space-joined, and prefixed with the "<AA2fold>" direction token per
+        Rostlab's documented usage -- so token 0 is the prefix token and
+        tokens 1..L are the L residues, matching the base class's
+        ``hidden[b, 1:L+1]`` convention exactly.
+        """
+        import re
+        prepped = ["<AA2fold> " + " ".join(re.sub(r"[UZOB]", "X", s.upper()))
+                   for s in seq_batch]
+        enc = self.tokenizer(
+            prepped, add_special_tokens=True, padding="longest", return_tensors="pt")
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+        out = self.t5.encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+        return out.last_hidden_state  # (B, 1+L+..., hidden): AA2fold prefix, residues..., pad
+
+
+def load_base_prostt5(name: str = "Rostlab/ProstT5"):
+    """Load the pretrained (frozen) ProstT5 encoder + tokenizer."""
+    from transformers import T5EncoderModel, T5Tokenizer
+    tokenizer = T5Tokenizer.from_pretrained(name, do_lower_case=False)
+    model = T5EncoderModel.from_pretrained(name)
+    return model.eval(), tokenizer
+
+
+def build_model_prostt5(device: str = "cpu", name: str = "Rostlab/ProstT5",
+                rank: int = 4, alpha: float = 8.0, n_lora_layers: int = 8,
+                dropout: float = 0.1, head_dim: int | None = None) -> "ProstT5EpitopeModel":
+    """Build an (untrained) ProstT5-backbone epiLoRA model on ``device``."""
+    t5_model, tokenizer = load_base_prostt5(name)
+    model = ProstT5EpitopeModel(t5_model, tokenizer, name=name, rank=rank, alpha=alpha,
+                                n_lora_layers=n_lora_layers, dropout=dropout, head_dim=head_dim).to(device)
+    return model

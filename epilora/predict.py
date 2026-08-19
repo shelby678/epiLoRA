@@ -40,6 +40,10 @@ def load_model(weights: Path, device: str) -> nn.Module:
         from model import ESM3EpitopeModel, load_base_esm3
         esm_model = load_base_esm3()
         model = ESM3EpitopeModel(esm_model, **cfg).to(device)
+    elif backbone == "prostt5":
+        from model import ProstT5EpitopeModel, load_base_prostt5
+        t5_model, tokenizer = load_base_prostt5(cfg["name"])
+        model = ProstT5EpitopeModel(t5_model, tokenizer, **cfg).to(device)
     else:
         from model import ESMCEpitopeModel, load_base_esmc
         esm_model = load_base_esmc(cfg["size"])
