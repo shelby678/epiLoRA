@@ -4,17 +4,51 @@ import os
 EXPORT_DIR  = "input_pdbs"
 REF_PDB_DIR = "input_pdbs/selected_32_pdbs"
 
+# ─── Which targets to run, and in what order: one PDB id per line in this
+# TSV, top to bottom. Override with `snakemake --config targets_tsv=other.tsv`
+TARGETS_TSV = config.get("targets_tsv", "targets.tsv")
+
+with open(TARGETS_TSV) as _fh:
+    TARGET_DNAME_LIST = [
+        _line.strip()
+        for _line in _fh
+        if _line.strip() and not _line.startswith("#") and _line.strip() != "pdb_id"
+    ]
+_seen = set()
+TARGET_DNAME_LIST = [d for d in TARGET_DNAME_LIST if not (d in _seen or _seen.add(d))]
+TARGET_DNAMES = set(TARGET_DNAME_LIST)
+TARGET_RANK = {d: i for i, d in enumerate(TARGET_DNAME_LIST)}
+
 DNAMES_WITH_REF = {
     os.path.splitext(os.path.basename(f))[0]
     for f in glob.glob(f"{REF_PDB_DIR}/*.pdb")
 }
 
+# ─── Job scheduling order: by default, earlier rows in targets.tsv are
+# preferred whenever cores are contended. `--config priority=7str` bumps a
+# dname above the TSV order entirely (e.g. to jump the queue mid-run). ──────
+PRIORITY_DNAMES = {d for d in config.get("priority", "").split(",") if d}
+
+
+def dname_priority(wc):
+    """Higher priority == scheduled first when cores are contended. This is
+    a scheduling *preference*, not a hard barrier: if cores are free, later
+    targets can still start alongside earlier ones still in flight."""
+    if wc.dname in PRIORITY_DNAMES:
+        return len(TARGET_DNAME_LIST) + 1
+    return len(TARGET_DNAME_LIST) - TARGET_RANK.get(wc.dname, len(TARGET_DNAME_LIST))
+
+
 # ─── Discover all (dname, ab_stem, ag_stem) combinations ─────────────────────
+# Only predicted structures: ab_1..ab_5 (not the ground-truth `ab`) docked
+# against the predicted antigen `ag` (not the ground-truth `ag_gt`).
 RUNS = []
 for _d in sorted(glob.glob(f"{EXPORT_DIR}/????")):
-    _dname   = os.path.basename(_d)
-    _ab_pdbs = sorted(glob.glob(f"{_d}/ab*.pdb"))
-    _ag_pdbs = sorted(glob.glob(f"{_d}/ag*.pdb"))
+    _dname = os.path.basename(_d)
+    if _dname not in TARGET_DNAMES:
+        continue
+    _ab_pdbs = sorted(glob.glob(f"{_d}/ab_[1-5].pdb"))
+    _ag_pdbs = sorted(glob.glob(f"{_d}/ag.pdb"))
     for _ab in _ab_pdbs:
         for _ag in _ag_pdbs:
             RUNS.append((
@@ -40,12 +74,25 @@ ALL_DONE = expand(
     ag=AGSTEMS,
 )
 
+# ─── Vanilla (no epiLoRA conditioning) mirror of the same (dname, ab, ag)
+# grid, for a direct epitope-conditioned-vs-surface-only comparison ─────────
+ALL_DONE_VANILLA = expand(
+    "runs_vanilla/{dname}/{ab}_vs_{ag}/done",
+    zip,
+    dname=DNAMES,
+    ab=ABSTEMS,
+    ag=AGSTEMS,
+)
+
 
 rule all:
     input:
         ALL_DONE,
+        ALL_DONE_VANILLA,
         "capri_results.csv",
         "rmsd_results.csv",
+        "capri_results_vanilla.csv",
+        "rmsd_results_vanilla.csv",
 
 
 rule prepare_pdbs:
@@ -58,6 +105,7 @@ rule prepare_pdbs:
         ag = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
     log:
         "logs/{dname}/prepare_pdbs_{ab}_vs_{ag}.log"
+    priority: dname_priority
     shell:
         "/opt/conda/bin/python scripts/prepare_pdbs.py"
         " --antibody {input.ab} --antigen {input.ag}"
@@ -84,25 +132,36 @@ rule prepare_reference:
 rule generate_restraints:
     """Generate CDR-based ambiguous and VH-VL unambiguous restraints.
 
-    Antigen passive residues are epiLoRA-constrained: surface (haddock3-
-    restraints calc_accessibility) intersected with cache/epitope/{dname}_{ag}.csv
-    residues at prob > 0.20 (precomputed once by stage_antigens.py ->
-    dump_residue_keys.py -> predict_ensemble.py -> build_epitope_cache.py,
-    since epiLoRA needs the epilora/env torch+esm stack this pipeline's
-    python doesn't have)."""
+    Antigen passive residues are epitope-constrained: surface (haddock3-
+    restraints calc_accessibility) intersected with
+    cache/epitope_ensemble/{dname}_{ag}.csv residues at prob > 0.42 --
+    epiLoRA rank-normalized 50/50 with DiscoTope-3.0 (the blend
+    benchmarking/ensemble_with_discotope.py found beats either model alone),
+    precomputed by epitope_cache.smk (stage_antigens -> dump_residue_keys ->
+    predict_ensemble -> build_epitope_cache, plus stage_antigens_ag_only ->
+    run_discotope3 -> build_epitope_cache_ensemble), since epiLoRA/DiscoTope-3.0
+    need their own torch+esm / xgboost envs this pipeline's python doesn't have.
+
+    0.42 (not the old plain-epiLoRA 0.20) because rank-normalizing
+    DiscoTope-3.0's score spreads it uniformly over [0, 1], which shifts the
+    blended score's distribution well above epiLoRA's own -- 0.42 was picked
+    empirically so the ensemble cache selects about the same average
+    fraction of each antigen's surface (~34%, across all 23 dnames) as the
+    old 0.20 cutoff did on the epiLoRA-only cache."""
     input:
         ab      = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
         ag      = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
-        epitope = "cache/epitope/{dname}_{ag}.csv",
+        epitope = "cache/epitope_ensemble/{dname}_{ag}.csv",
     output:
         ambig   = "runs/{dname}/{ab}_vs_{ag}/ambig.tbl",
         unambig = "runs/{dname}/{ab}_vs_{ag}/unambig.tbl",
     log:
         "logs/{dname}/generate_restraints_{ab}_vs_{ag}.log"
+    priority: dname_priority
     shell:
         "/opt/conda/bin/python scripts/generate_restraints.py"
         " --ab {input.ab} --ag {input.ag}"
-        " --epitope-csv {input.epitope} --epitope-threshold 0.20"
+        " --epitope-csv {input.epitope} --epitope-threshold 0.42"
         " --ambig {output.ambig} --unambig {output.unambig}"
         " > {log} 2>&1"
 
@@ -122,6 +181,7 @@ rule haddock_config:
         cfg = "runs/{dname}/{ab}_vs_{ag}/run.toml",
     log:
         "logs/{dname}/haddock_config_{ab}_vs_{ag}.log"
+    priority: dname_priority
     params:
         ref_arg = lambda wc, input: input.ref[0] if input.ref else "",
     shell:
@@ -144,10 +204,82 @@ rule run_haddock:
         done = "runs/{dname}/{ab}_vs_{ag}/done",
     log:
         "logs/{dname}/{ab}_vs_{ag}.log",
-    threads: 1
+    threads: 12
+    priority: dname_priority
     params:
         restart = 0,
         rts     = "+RTS -N1 -A64m -RTS",
+    shell:
+        """
+        env/bin/haddock3 {input.cfg} --restart {params.restart} > {log} 2>&1
+        touch {output.done}
+        """
+
+
+rule generate_restraints_vanilla:
+    """Same as generate_restraints but with no epiLoRA conditioning: antigen
+    passive residues are the full surface (haddock3-restraints
+    calc_accessibility only), matching the vanilla-HADDOCK baseline in
+    ~/work/ab_MD/haddocking2. Reuses the epitope-variant's prepared PDBs
+    (input_ab.pdb/input_ag.pdb are identical regardless of restraint choice)."""
+    input:
+        ab = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+    output:
+        ambig   = "runs_vanilla/{dname}/{ab}_vs_{ag}/ambig.tbl",
+        unambig = "runs_vanilla/{dname}/{ab}_vs_{ag}/unambig.tbl",
+    log:
+        "logs_vanilla/{dname}/generate_restraints_{ab}_vs_{ag}.log"
+    priority: dname_priority
+    shell:
+        "/opt/conda/bin/python scripts/generate_restraints.py"
+        " --ab {input.ab} --ag {input.ag}"
+        " --ambig {output.ambig} --unambig {output.unambig}"
+        " > {log} 2>&1"
+
+
+rule haddock_config_vanilla:
+    """Generate the HADDOCK3 TOML config for the vanilla (no epiLoRA) run."""
+    input:
+        ab      = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag      = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+        ambig   = "runs_vanilla/{dname}/{ab}_vs_{ag}/ambig.tbl",
+        unambig = "runs_vanilla/{dname}/{ab}_vs_{ag}/unambig.tbl",
+        ref     = lambda wc: (
+            [f"runs/{wc.dname}/reference.pdb"] if wc.dname in DNAMES_WITH_REF else []
+        ),
+        template = "template.cfg",
+    output:
+        cfg = "runs_vanilla/{dname}/{ab}_vs_{ag}/run.toml",
+    log:
+        "logs_vanilla/{dname}/haddock_config_{ab}_vs_{ag}.log"
+    priority: dname_priority
+    params:
+        ref_arg = lambda wc, input: input.ref[0] if input.ref else "",
+    shell:
+        "bash scripts/make_haddock_config.sh"
+        " {input.template} {input.ab} {input.ag}"
+        " {input.ambig} {input.unambig}"
+        " {output.cfg} {params.ref_arg}"
+        " > {log} 2>&1"
+
+
+rule run_haddock_vanilla:
+    """Run HADDOCK3 docking for the vanilla (no epiLoRA conditioning) variant."""
+    input:
+        cfg     = "runs_vanilla/{dname}/{ab}_vs_{ag}/run.toml",
+        ab      = "runs/{dname}/{ab}_vs_{ag}/input_ab.pdb",
+        ag      = "runs/{dname}/{ab}_vs_{ag}/input_ag.pdb",
+        ambig   = "runs_vanilla/{dname}/{ab}_vs_{ag}/ambig.tbl",
+        unambig = "runs_vanilla/{dname}/{ab}_vs_{ag}/unambig.tbl",
+    output:
+        done = "runs_vanilla/{dname}/{ab}_vs_{ag}/done",
+    log:
+        "logs_vanilla/{dname}/{ab}_vs_{ag}.log",
+    threads: 12
+    priority: dname_priority
+    params:
+        restart = 0,
     shell:
         """
         env/bin/haddock3 {input.cfg} --restart {params.restart} > {log} 2>&1
@@ -191,5 +323,38 @@ rule compute_rmsd:
     shell:
         "/opt/conda/bin/python scripts/compute_rmsd.py"
         " --runs-dir runs"
+        " --out {output.csv} --summary-out {output.summary}"
+        " > {log} 2>&1"
+
+
+rule capri_analysis_vanilla:
+    """Same as capri_analysis, but for the vanilla (no epiLoRA) run tree."""
+    input:
+        done = ALL_DONE_VANILLA,
+    output:
+        csv  = "capri_results_vanilla.csv",
+        plot = "capri_plot_vanilla.png",
+    log:
+        "logs/capri_analysis_vanilla.log"
+    shell:
+        "/opt/conda/bin/python scripts/capri_analysis.py"
+        " --runs-dir runs_vanilla --crystal-dir {REF_PDB_DIR}"
+        " --ab-dir {EXPORT_DIR} --ag-dir {EXPORT_DIR}"
+        " --out-csv {output.csv} --out-plot {output.plot}"
+        " > {log} 2>&1"
+
+
+rule compute_rmsd_vanilla:
+    """Same as compute_rmsd, but for the vanilla (no epiLoRA) run tree."""
+    input:
+        done = ALL_DONE_VANILLA,
+    output:
+        csv     = "rmsd_results_vanilla.csv",
+        summary = "rmsd_summary_vanilla.csv",
+    log:
+        "logs/compute_rmsd_vanilla.log"
+    shell:
+        "/opt/conda/bin/python scripts/compute_rmsd.py"
+        " --runs-dir runs_vanilla"
         " --out {output.csv} --summary-out {output.summary}"
         " > {log} 2>&1"

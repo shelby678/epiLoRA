@@ -4,6 +4,9 @@ scratch/
 .snakemake/
 input_pdbs
 runs/
+runs_vanilla/
+targets.tsv
+
 logs/
 __pycache__/
 .ipynb_checkpoints/
