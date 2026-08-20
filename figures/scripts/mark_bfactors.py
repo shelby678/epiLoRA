@@ -4,7 +4,12 @@ call, one from epiLoRA's predicted per-residue epitope probability.
 
 Ground truth uses the exact same 4A heavy-atom contact rule as
 data/scripts/get_epitopes.py (Hchain+Lchain heavy atoms vs. each antigen
-residue's heavy atoms), reusing data/scripts/structures.py's helpers.
+residue's heavy atoms), reusing data/scripts/structures.py's helpers. The
+ground-truth structure file also includes the real Hchain/Lchain that
+epitope was contact-mapped against (b-factor 0, since only antigen residues
+get an epitope call) so the antibody-antigen complex can be viewed together;
+the prediction structure stays antigen-only, since epiLoRA's prediction
+doesn't depend on -- and isn't paired with -- any particular antibody.
 
 Predictions reuse epilora/predict.py's load_model/predict (5-checkpoint
 "champion" ensemble, allowed_species_homo_sapiens folds 1-5 -- the
@@ -82,10 +87,12 @@ class ChainSelect(Select):
         return chain.id in self.chain_ids
 
 
-def write_cif(model, antigen_chains, bfactors_by_residue, out_path):
-    """bfactors_by_residue: dict keyed by id(residue) -> float; residues not
-    present get 0.0 (unmatched, same convention as color_by_prediction.py)."""
-    for chain_id in antigen_chains:
+def write_cif(model, chain_ids, bfactors_by_residue, out_path):
+    """chain_ids: every chain to include in the output file (antigen, plus
+    optionally the antibody). bfactors_by_residue: dict keyed by id(residue)
+    -> float; residues not present (e.g. antibody residues) get 0.0
+    (unmatched, same convention as color_by_prediction.py)."""
+    for chain_id in chain_ids:
         if chain_id not in model:
             continue
         for res in model[chain_id]:
@@ -94,7 +101,7 @@ def write_cif(model, antigen_chains, bfactors_by_residue, out_path):
                 atom.set_bfactor(b)
     io = MMCIFIO()
     io.set_structure(model.get_parent())  # Structure, so MMCIFIO can find the model id
-    io.save(str(out_path), select=ChainSelect(antigen_chains))
+    io.save(str(out_path), select=ChainSelect(chain_ids))
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,7 +149,8 @@ for row in rows:
 
         pred_bfactors = {id(res): 100.0 * float(p) for res, p in zip(antigen_residues, mean_probs)}
 
-        write_cif(model, antigen_chains, gt_bfactors, gt_dir / f"{instance}.cif")
+        gt_chains = list(dict.fromkeys(antigen_chains + [row["Hchain"], row["Lchain"]]))
+        write_cif(model, gt_chains, gt_bfactors, gt_dir / f"{instance}.cif")
         write_cif(model, antigen_chains, pred_bfactors, pred_dir / f"{instance}.cif")
 
         with open(csv_dir / f"{instance}.csv", "w", newline="") as cf:
