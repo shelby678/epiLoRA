@@ -204,7 +204,7 @@ rule run_haddock:
         done = "runs/{dname}/{ab}_vs_{ag}/done",
     log:
         "logs/{dname}/{ab}_vs_{ag}.log",
-    threads: 12
+    threads: 50
     priority: dname_priority
     params:
         restart = 0,
@@ -276,7 +276,7 @@ rule run_haddock_vanilla:
         done = "runs_vanilla/{dname}/{ab}_vs_{ag}/done",
     log:
         "logs_vanilla/{dname}/{ab}_vs_{ag}.log",
-    threads: 12
+    threads: 50
     priority: dname_priority
     params:
         restart = 0,
