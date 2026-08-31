@@ -1,270 +1,297 @@
-# Generic epitope pipeline: given ANY input structure (not necessarily one
-# of ours, not necessarily bound to an antibody) -- possibly holding several
-# separate antigen copies, each scored independently -- produce two combined
-# annotated structures:
+# Epitope-figure pipeline: given a query structure and/or a SAbDab summary
+# TSV, produce up to three results, each carrying epitope calls in the
+# B-factor column (color by B-factor in PyMOL/ChimeraX):
 #
-#   {tag}_groundtruth_bfactor.{ext}   B-factor = epitope-by-homology, unioned
-#                                      across every training-corpus sequence
-#                                      the query resembles at >= min_seq_id
-#                                      identity (see groundtruth_from_homology.py)
-#   {tag}_prediction_bfactor.{ext}    B-factor = epiLoRA's predicted
-#                                      per-residue epitope probability
-#
-# Both cover every chain group configured (see 'chain_groups' below) in ONE
-# file each, not one file per group.
-#
-# Three separate mmseqs homology searches per group drive this (see
-# homology_search.py):
-#   - vs. the full training corpus (train_fasta), unioned across every hit
-#     above min_seq_id, to transfer known epitope calls onto the query by
-#     homology when nothing in the query's own file tells us where the
-#     epitope is (e.g. an apo antigen with no bound Ab).
-#   - vs. the champion model's own training fasta (champion_fasta), to pick
-#     the single hit whose fold, if any, never saw this antigen/its
-#     homologs during training -- see pick_fold.py. This threshold
-#     (fold_avoid_min_seq_id) is deliberately more lenient than min_seq_id:
-#     even a "somewhat similar" (>=80% identity) training cluster is enough
-#     reason to route around the one fold that saw it. If nothing overlaps
-#     above that bar, falls back to the full 5-fold ensemble mean.
-#   - vs. the per-structure (not per-cluster) training fasta (member_fasta),
-#     purely to list every actual SAbDab structure the query resembles
-#     (matches_members.csv).
+#   {tag}_groundtruth_bfactor.{ext}   query antigen, epitope-by-homology:
+#                                     unioned across every training-corpus hit
+#                                     >= min_seq_id
+#   {tag}_prediction_bfactor.{ext}    query antigen, epiLoRA per-residue
+#                                     epitope probability
+#   combined_on_{ref_antigen_pdb}.cif conjoined ground truth: one reference
+#                                     antigen with every surviving antibody's
+#                                     Fv superposed onto it (overlaps OK),
+#                                     antigen B-factors marking the union of
+#                                     antibody contacts
 #
 # Usage:
 #   snakemake --cores 4 --config input_pdb=/path/to/query.pdb
 #   snakemake --cores 4 --config input_pdb=/path/to/query.cif chain=A
 #   snakemake --cores 4 --config input_pdb=complex.cif "chain_groups=A|D;B|E|O;C|F|K"
+#   snakemake --cores 4 --config conjoined_tsv=ebola/ebola_summary.tsv
+#   snakemake --cores 4 --config input_pdb=... conjoined_tsv=...   (all three)
 #
-# Config (all overridable via --config key=value):
-#   input_pdb              required. .pdb or .cif structure to annotate.
-#   chain                  antigen chain(s) for a single group: a single chain id, or
-#                          '|'-separated (e.g. 'A|D') for a multi-chain antigen.
-#                          Default: first chain in the file. Ignored if chain_groups is set.
-#   chain_groups           ';'-separated list of chain specs (each itself optionally
-#                          '|'-separated), one per independently-scored antigen copy in
-#                          the same file, e.g. 'A|D;B|E|O;C|F|K'. All groups are scored
-#                          separately, then merged into ONE combined output structure.
-#   outdir                 default: results/{stem}/{tag}
-#   train_fasta            homology-transfer corpus (default: data/results/epitopes.fasta --
-#                          one row per raw antigen instance, so a near-exact structure match
-#                          isn't missed just because it wasn't elected as its cluster's
-#                          representative in the train_test_eval/*_epitopes.fasta files)
-#   champion_fasta         champion model's own training fasta, for fold selection
+# Config (overridable via --config key=value):
+#   input_pdb              .pdb or .cif query structure (omit when only
+#                          building the conjoined structure)
+#   chain                  single chain id, or '|'-several for a multi-chain
+#                          antigen. Default: first chain in the file.
+#   chain_groups           ';'-separated chain specs, one per independently-
+#                          scored antigen copy in the same file.
+#   outdir                 default: results/{tag}
+#   train_fasta            homology-transfer corpus
+#   champion_fasta         champion model's training fasta, for fold selection
 #   champion_weights_glob  glob matching the champion's 5 per-fold checkpoints
-#   min_seq_id / min_aln_len  "pretty similar" thresholds for ground-truth transfer and
-#                           matches-listing: identity over the aligned region (mmseqs2
-#                           --min-seq-id) and a minimum aligned-residue count. No length-ratio
-#                           coverage filter, so a query that's a subsequence of a much longer
-#                           training antigen (or vice versa) still counts as a hit.
-#   fold_avoid_min_seq_id  separate, more lenient threshold (default 0.80) used only for
-#                           fold selection: if any training cluster is at least this similar,
-#                           avoid the one fold that saw it (see pick_fold.py); if none is,
-#                           use the full 5-fold ensemble instead of guessing which fold's safe.
-#   member_fasta           per-structure (not per-cluster) training fasta, for
-#                           matches_members.csv -- every actual SAbDab structure/instance
-#                           the query resembles above min_seq_id/min_aln_len, ranked by identity.
+#   min_seq_id / min_aln_len     identity and aligned-length floors for a hit
+#                          (no coverage-ratio filter: a short-subsequence match
+#                          still counts)
+#   fold_avoid_min_seq_id  more lenient threshold (default 0.80) for fold
+#                          selection only
+#   conjoined_tsv          SAbDab summary TSV to build the conjoined ground-
+#                          truth structure from (omit to skip that result)
+#   structures_dir         raw SAbDab structures (<pdb>/<pdb>_sabdab.cif)
+#   ref_pdb / ref_chains   reference trimer the antibodies are placed against
+#   ref_antigen_pdb        PDB whose antigen every survivor is superposed onto
+#   conjoined_outdir       default: results/conjoined_groundtruth
+#   env_python             pipeline python (the fair-esm env by default)
+import csv
 import subprocess
 from pathlib import Path
 
 config.setdefault("input_pdb", None)
-if config["input_pdb"] is None:
-    raise WorkflowError("pass --config input_pdb=/path/to/query.pdb (or .cif)")
+config.setdefault("conjoined_tsv", None)
+if config["input_pdb"] is None and config["conjoined_tsv"] is None:
+    raise WorkflowError("pass --config input_pdb=... and/or conjoined_tsv=...")
 
-INPUT_PDB = config["input_pdb"]
-STEM = Path(INPUT_PDB).stem
-EXT = Path(INPUT_PDB).suffix.lstrip(".").lower()
-if EXT not in ("pdb", "cif"):
-    raise WorkflowError(f"input_pdb must be .pdb or .cif, got {INPUT_PDB!r}")
-
-config.setdefault("chain", None)
-config.setdefault("chain_groups", None)
 config.setdefault("train_fasta", "../data/results/epitopes.fasta")
 config.setdefault("champion_fasta", "../data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta")
 config.setdefault("champion_weights_glob", "../weights/ablation/allowed_species_homo_sapiens_fold?.pt")
-config.setdefault("member_fasta", "../data/train_test_eval/eval/train_clusters.fasta")
 config.setdefault("min_seq_id", 0.95)
 config.setdefault("fold_avoid_min_seq_id", 0.80)
 config.setdefault("min_aln_len", 20)
 config.setdefault("db_dir", "db")
+config.setdefault("env_python", "../epilora/env/bin/python3")
 
 DB_DIR = config["db_dir"]
-EPILORA_PY = "../epilora/env/bin/python3"
+PY = config["env_python"]
 
-CORPUS_FASTA = {"train": config["train_fasta"], "champion": config["champion_fasta"], "members": config["member_fasta"]}
-# Fold-avoidance uses its own, more lenient threshold: even a merely
-# "somewhat similar" cluster is reason enough to route around the one fold
-# that saw it, so this stays lower than the real-match bar used for
-# ground-truth transfer and the matches list.
-MIN_SEQ_ID = {"train": config["min_seq_id"], "champion": config["fold_avoid_min_seq_id"],
-              "members": config["min_seq_id"]}
+DEFAULT_TARGETS = []
 
-if config["chain_groups"]:
-    GROUP_SPECS = config["chain_groups"].split(";")
-else:
-    chain_spec = config["chain"]
-    if chain_spec is None:
-        chain_spec = subprocess.run(
-            [EPILORA_PY, "-c",
-             "import sys; sys.path.insert(0, 'scripts'); from epitope_pipeline_common import default_chain; "
-             f"print(default_chain({INPUT_PDB!r}))"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-    GROUP_SPECS = [chain_spec]
 
-GROUP_SLUGS = [spec.replace("|", "-") for spec in GROUP_SPECS]
-if len(set(GROUP_SLUGS)) != len(GROUP_SLUGS):
-    raise WorkflowError(f"duplicate chain group among {GROUP_SPECS!r}")
-CHAIN_OF_GROUP = dict(zip(GROUP_SLUGS, GROUP_SPECS))
+# ---------------- query-structure results ----------------
+if config["input_pdb"] is not None:
+    INPUT_PDB = config["input_pdb"]
+    STEM = Path(INPUT_PDB).stem
+    EXT = Path(INPUT_PDB).suffix.lstrip(".").lower()
+    if EXT not in ("pdb", "cif"):
+        raise WorkflowError(f"input_pdb must be .pdb or .cif, got {INPUT_PDB!r}")
 
-# Different chain/chain_groups configs against the *same* input_pdb must not
-# clobber each other's outputs, so the group spec is folded into the tag.
-TAG = f"{STEM}_{'_'.join(GROUP_SLUGS)}"
-config.setdefault("outdir", f"results/{TAG}")
-OUTDIR = config["outdir"]
-GROUPDIR = f"{OUTDIR}/groups/{{group}}"
+    config.setdefault("chain", None)
+    config.setdefault("chain_groups", None)
+    if config["chain_groups"]:
+        GROUP_SPECS = config["chain_groups"].split(";")
+    else:
+        chain_spec = config["chain"]
+        if chain_spec is None:
+            chain_spec = subprocess.run(
+                [PY, "-c",
+                 "import sys; sys.path.insert(0, 'scripts'); from epitope_pipeline_common import default_chain; "
+                 f"print(default_chain({INPUT_PDB!r}))"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+        GROUP_SPECS = [chain_spec]
+
+    GROUP_SLUGS = [spec.replace("|", "-") for spec in GROUP_SPECS]
+    if len(set(GROUP_SLUGS)) != len(GROUP_SLUGS):
+        raise WorkflowError(f"duplicate chain group among {GROUP_SPECS!r}")
+    CHAIN_OF_GROUP = dict(zip(GROUP_SLUGS, GROUP_SPECS))
+
+    # The group spec is folded into the tag so different chain/chain_groups
+    # configs against the same input_pdb don't clobber each other's outputs.
+    TAG = f"{STEM}_{'_'.join(GROUP_SLUGS)}"
+    config.setdefault("outdir", f"results/{TAG}")
+    OUTDIR = config["outdir"]
+    GROUPDIR = f"{OUTDIR}/groups/{{group}}"
+
+    CORPUS_FASTA = {"train": config["train_fasta"], "champion": config["champion_fasta"]}
+    # Fold avoidance is deliberately more lenient than ground-truth transfer:
+    # even a "somewhat similar" cluster is reason to route around the one
+    # fold that saw it.
+    MIN_SEQ_ID = {"train": config["min_seq_id"], "champion": config["fold_avoid_min_seq_id"]}
+
+    DEFAULT_TARGETS += [
+        f"{OUTDIR}/{TAG}_groundtruth_bfactor.{EXT}",
+        f"{OUTDIR}/{TAG}_prediction_bfactor.{EXT}",
+    ]
+
+
+# ---------------- conjoined ground-truth structure ----------------
+if config["conjoined_tsv"] is not None:
+    config.setdefault("structures_dir", "../data/raw/all-structures-extracted")
+    config.setdefault("ref_pdb", "pdb_00007kfe")
+    config.setdefault("ref_chains", "A,B,C,D,E,F")
+    config.setdefault("ref_antigen_pdb", "pdb_00006qd8")
+    config.setdefault("conjoined_outdir", "results/conjoined_groundtruth")
+
+    CONJOINED_TSV = config["conjoined_tsv"]
+    STRUCTURES_DIR = config["structures_dir"]
+    REF_PDB = config["ref_pdb"]
+    REF_CHAINS = config["ref_chains"]
+    REF_ANTIGEN_PDB = config["ref_antigen_pdb"]
+    CONJOINED_OUTDIR = config["conjoined_outdir"]
+
+    # Every structure the script may open: one per TSV row's PDB, plus both
+    # reference structures.
+    with open(CONJOINED_TSV, newline="") as f:
+        conjoined_pdbs = {r["PDB"] for r in csv.DictReader(f, delimiter="\t")}
+    conjoined_pdbs |= {REF_PDB, REF_ANTIGEN_PDB}
+    CONJOINED_STRUCTS = sorted(f"{STRUCTURES_DIR}/{p}/{p}_sabdab.cif" for p in conjoined_pdbs)
+
+    DEFAULT_TARGETS.append(f"{CONJOINED_OUTDIR}/combined_on_{REF_ANTIGEN_PDB}.cif")
 
 
 rule all:
     input:
-        f"{OUTDIR}/{TAG}_groundtruth_bfactor.{EXT}",
-        f"{OUTDIR}/{TAG}_prediction_bfactor.{EXT}",
-        expand(f"{OUTDIR}/groups/{{group}}/fold_choice.json", group=GROUP_SLUGS),
-        expand(f"{OUTDIR}/groups/{{group}}/matches_members.csv", group=GROUP_SLUGS),
+        DEFAULT_TARGETS
 
 
-rule prepare_corpus_db:
-    """Stage one training corpus for mmseqs: uppercase for search, plus a
-    side JSON mapping back to its original metadata. Auto-detects flat
-    (one row per record) vs. block ('>>CLUSTER' -- the per-structure
-    'members' corpus) format -- see prepare_corpus_db.py."""
-    input:
-        lambda wc: CORPUS_FASTA[wc.corpus]
-    output:
-        fasta=f"{DB_DIR}/{{corpus}}.search.fasta",
-        meta=f"{DB_DIR}/{{corpus}}.meta.json",
-    log:
-        f"{DB_DIR}/{{corpus}}.prepare.log"
-    shell:
-        "{EPILORA_PY} scripts/prepare_corpus_db.py --in_fasta {input}"
-        " --out_fasta {output.fasta} --out_meta {output.meta} --log {log}"
+if config["input_pdb"] is not None:
+
+    rule prepare_corpus_db:
+        """Stage one training corpus for mmseqs: uppercase for search, plus a
+        side JSON mapping back to its original metadata."""
+        input:
+            lambda wc: CORPUS_FASTA[wc.corpus]
+        output:
+            fasta=f"{DB_DIR}/{{corpus}}.search.fasta",
+            meta=f"{DB_DIR}/{{corpus}}.meta.json",
+        log:
+            f"{DB_DIR}/{{corpus}}.prepare.log"
+        shell:
+            "{PY} scripts/0_prepare_corpus_db.py --in_fasta {input}"
+            " --out_fasta {output.fasta} --out_meta {output.meta} --log {log}"
+
+    rule mmseqs_createdb:
+        """Build the mmseqs DB once per corpus; every query/group reuses it."""
+        input:
+            f"{DB_DIR}/{{corpus}}.search.fasta"
+        output:
+            f"{DB_DIR}/{{corpus}}.db.dbtype"
+        log:
+            f"{DB_DIR}/{{corpus}}.createdb.log"
+        params:
+            db=f"{DB_DIR}/{{corpus}}.db"
+        shell:
+            "mmseqs createdb {input} {params.db} > {log} 2>&1"
+
+    rule homology_search:
+        input:
+            pdb=INPUT_PDB,
+            db=f"{DB_DIR}/{{corpus}}.db.dbtype",
+            meta=f"{DB_DIR}/{{corpus}}.meta.json",
+        output:
+            json=f"{GROUPDIR}/homology_{{corpus}}.json",
+            all_hits=f"{GROUPDIR}/all_hits_{{corpus}}.json",
+        log:
+            f"{GROUPDIR}/logs/homology_search_{{corpus}}.log"
+        params:
+            chain=lambda wc: CHAIN_OF_GROUP[wc.group],
+            db=f"{DB_DIR}/{{corpus}}.db",
+            min_seq_id=lambda wc: MIN_SEQ_ID[wc.corpus],
+            min_aln_len=config["min_aln_len"],
+        shell:
+            "{PY} scripts/1_homology_search.py --pdb {input.pdb} --chain '{params.chain}'"
+            " --target_db {params.db} --target_meta {input.meta}"
+            " --out_json {output.json} --out_all_hits {output.all_hits} --log {log}"
+            " --min_seq_id {params.min_seq_id} --min_aln_len {params.min_aln_len}"
+
+    rule groundtruth_from_homology:
+        input:
+            pdb=INPUT_PDB,
+            all_hits=f"{GROUPDIR}/all_hits_train.json",
+        output:
+            f"{GROUPDIR}/groundtruth.csv"
+        log:
+            f"{GROUPDIR}/logs/groundtruth_from_homology.log"
+        params:
+            chain=lambda wc: CHAIN_OF_GROUP[wc.group]
+        shell:
+            "{PY} scripts/2_groundtruth_from_homology.py --pdb {input.pdb} --chain '{params.chain}'"
+            " --all_hits_json {input.all_hits} --out_csv {output} --log {log}"
+
+    rule pick_fold:
+        input:
+            f"{GROUPDIR}/homology_champion.json"
+        output:
+            f"{GROUPDIR}/fold_choice.json"
+        log:
+            f"{GROUPDIR}/logs/pick_fold.log"
+        params:
+            weights_glob=config["champion_weights_glob"]
+        shell:
+            "{PY} scripts/3_pick_fold.py --homology_json {input} --weights_glob '{params.weights_glob}'"
+            " --out_json {output} --log {log}"
+
+    rule predict_epitope:
+        input:
+            pdb=INPUT_PDB,
+            fold_choice=f"{GROUPDIR}/fold_choice.json",
+        output:
+            f"{GROUPDIR}/prediction.csv"
+        log:
+            f"{GROUPDIR}/logs/predict_epitope.log"
+        params:
+            chain=lambda wc: CHAIN_OF_GROUP[wc.group]
+        shell:
+            "{PY} scripts/4_predict_epitope.py --pdb {input.pdb} --chain '{params.chain}'"
+            " --fold_choice {input.fold_choice} --out_csv {output} --log {log}"
+
+    rule combine_groundtruth_structure:
+        """Merge every group's groundtruth.csv into ONE output structure."""
+        input:
+            pdb=INPUT_PDB,
+            csvs=expand(f"{OUTDIR}/groups/{{group}}/groundtruth.csv", group=GROUP_SLUGS),
+        output:
+            f"{OUTDIR}/{TAG}_groundtruth_bfactor.{EXT}"
+        log:
+            f"{OUTDIR}/logs/combine_groundtruth_structure.log"
+        params:
+            pairs=lambda wc, input: " ".join(
+                f"--chain '{CHAIN_OF_GROUP[g]}' --values_csv {csv}" for g, csv in zip(GROUP_SLUGS, input.csvs)
+            )
+        shell:
+            "{PY} scripts/5_write_bfactor_structure.py --pdb {input.pdb} {params.pairs}"
+            " --out {output} --log {log}"
+
+    rule combine_prediction_structure:
+        """Merge every group's prediction.csv into ONE output structure."""
+        input:
+            pdb=INPUT_PDB,
+            csvs=expand(f"{OUTDIR}/groups/{{group}}/prediction.csv", group=GROUP_SLUGS),
+        output:
+            f"{OUTDIR}/{TAG}_prediction_bfactor.{EXT}"
+        log:
+            f"{OUTDIR}/logs/combine_prediction_structure.log"
+        params:
+            pairs=lambda wc, input: " ".join(
+                f"--chain '{CHAIN_OF_GROUP[g]}' --values_csv {csv}" for g, csv in zip(GROUP_SLUGS, input.csvs)
+            )
+        shell:
+            "{PY} scripts/5_write_bfactor_structure.py --pdb {input.pdb} {params.pairs}"
+            " --out {output} --log {log}"
 
 
-rule mmseqs_createdb:
-    """Build the mmseqs DB once per corpus; every query/group reuses it
-    instead of re-indexing the training data every time."""
-    input:
-        f"{DB_DIR}/{{corpus}}.search.fasta"
-    output:
-        f"{DB_DIR}/{{corpus}}.db.dbtype"
-    log:
-        f"{DB_DIR}/{{corpus}}.createdb.log"
-    params:
-        db=f"{DB_DIR}/{{corpus}}.db"
-    shell:
-        "mmseqs createdb {input} {params.db} > {log} 2>&1"
+if config["conjoined_tsv"] is not None:
 
-
-rule homology_search:
-    input:
-        pdb=INPUT_PDB,
-        db=f"{DB_DIR}/{{corpus}}.db.dbtype",
-        meta=f"{DB_DIR}/{{corpus}}.meta.json",
-    output:
-        json=f"{GROUPDIR}/homology_{{corpus}}.json",
-        matches=f"{GROUPDIR}/matches_{{corpus}}.csv",
-        all_hits=f"{GROUPDIR}/all_hits_{{corpus}}.json",
-    log:
-        f"{GROUPDIR}/logs/homology_search_{{corpus}}.log"
-    params:
-        chain=lambda wc: CHAIN_OF_GROUP[wc.group],
-        db=f"{DB_DIR}/{{corpus}}.db",
-        min_seq_id=lambda wc: MIN_SEQ_ID[wc.corpus],
-        min_aln_len=config["min_aln_len"],
-    shell:
-        "{EPILORA_PY} scripts/homology_search.py --pdb {input.pdb} --chain '{params.chain}'"
-        " --target_db {params.db} --target_meta {input.meta}"
-        " --out_json {output.json} --out_matches {output.matches}"
-        " --out_all_hits {output.all_hits} --log {log}"
-        " --min_seq_id {params.min_seq_id} --min_aln_len {params.min_aln_len}"
-
-
-rule groundtruth_from_homology:
-    input:
-        pdb=INPUT_PDB,
-        all_hits=f"{GROUPDIR}/all_hits_train.json",
-    output:
-        f"{GROUPDIR}/groundtruth.csv"
-    log:
-        f"{GROUPDIR}/logs/groundtruth_from_homology.log"
-    params:
-        chain=lambda wc: CHAIN_OF_GROUP[wc.group]
-    shell:
-        "{EPILORA_PY} scripts/groundtruth_from_homology.py --pdb {input.pdb} --chain '{params.chain}'"
-        " --all_hits_json {input.all_hits} --out_csv {output} --log {log}"
-
-
-rule pick_fold:
-    input:
-        f"{GROUPDIR}/homology_champion.json"
-    output:
-        f"{GROUPDIR}/fold_choice.json"
-    log:
-        f"{GROUPDIR}/logs/pick_fold.log"
-    params:
-        weights_glob=config["champion_weights_glob"]
-    shell:
-        "{EPILORA_PY} scripts/pick_fold.py --homology_json {input} --weights_glob '{params.weights_glob}'"
-        " --out_json {output} --log {log}"
-
-
-rule predict_epitope:
-    input:
-        pdb=INPUT_PDB,
-        fold_choice=f"{GROUPDIR}/fold_choice.json",
-    output:
-        f"{GROUPDIR}/prediction.csv"
-    log:
-        f"{GROUPDIR}/logs/predict_epitope.log"
-    params:
-        chain=lambda wc: CHAIN_OF_GROUP[wc.group]
-    shell:
-        "{EPILORA_PY} scripts/predict_epitope.py --pdb {input.pdb} --chain '{params.chain}'"
-        " --fold_choice {input.fold_choice} --out_csv {output} --log {log}"
-
-
-rule combine_groundtruth_structure:
-    """Merge every group's groundtruth.csv into ONE output structure covering
-    every group's chains, instead of one file per group."""
-    input:
-        pdb=INPUT_PDB,
-        csvs=expand(f"{OUTDIR}/groups/{{group}}/groundtruth.csv", group=GROUP_SLUGS),
-    output:
-        f"{OUTDIR}/{TAG}_groundtruth_bfactor.{EXT}"
-    log:
-        f"{OUTDIR}/logs/combine_groundtruth_structure.log"
-    params:
-        pairs=lambda wc, input: " ".join(
-            f"--chain '{CHAIN_OF_GROUP[g]}' --values_csv {csv}" for g, csv in zip(GROUP_SLUGS, input.csvs)
-        )
-    shell:
-        "{EPILORA_PY} scripts/write_bfactor_structure.py --pdb {input.pdb} {params.pairs}"
-        " --out {output} --log {log}"
-
-
-rule combine_prediction_structure:
-    """Merge every group's prediction.csv into ONE output structure covering
-    every group's chains, instead of one file per group."""
-    input:
-        pdb=INPUT_PDB,
-        csvs=expand(f"{OUTDIR}/groups/{{group}}/prediction.csv", group=GROUP_SLUGS),
-    output:
-        f"{OUTDIR}/{TAG}_prediction_bfactor.{EXT}"
-    log:
-        f"{OUTDIR}/logs/combine_prediction_structure.log"
-    params:
-        pairs=lambda wc, input: " ".join(
-            f"--chain '{CHAIN_OF_GROUP[g]}' --values_csv {csv}" for g, csv in zip(GROUP_SLUGS, input.csvs)
-        )
-    shell:
-        "{EPILORA_PY} scripts/write_bfactor_structure.py --pdb {input.pdb} {params.pairs}"
-        " --out {output} --log {log}"
+    rule conjoined_groundtruth_structure:
+        """Build the conjoined ground-truth structure: filter the SAbDab
+        summary's complexes (human antibody, placeable on the reference
+        trimer without clashing, non-redundant, antigen ~reference) and write
+        one reference antigen plus every survivor's Fv."""
+        input:
+            tsv=CONJOINED_TSV,
+            structures=CONJOINED_STRUCTS,
+        output:
+            cif=f"{CONJOINED_OUTDIR}/combined_on_{REF_ANTIGEN_PDB}.cif",
+            mapping=f"{CONJOINED_OUTDIR}/combined_on_{REF_ANTIGEN_PDB}_mapping.tsv",
+        log:
+            f"{CONJOINED_OUTDIR}/logs/conjoined_groundtruth_structure.log"
+        params:
+            structures_dir=STRUCTURES_DIR,
+            out_dir=CONJOINED_OUTDIR,
+            ref_pdb=REF_PDB,
+            ref_chains=REF_CHAINS,
+            ref_antigen_pdb=REF_ANTIGEN_PDB,
+        shell:
+            "{PY} scripts/6_finalize_groundtruth_structs.py {input.tsv} {params.structures_dir}"
+            " {params.out_dir} {log} --ref_pdb {params.ref_pdb} --ref_chains '{params.ref_chains}'"
+            " --ref_antigen_pdb {params.ref_antigen_pdb}"

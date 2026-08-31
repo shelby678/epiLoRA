@@ -1,31 +1,15 @@
 """Pick which champion checkpoint(s) to run on the query, from
-homology_search.py's best hit against the champion's own training FASTA
-(the exact fasta its 5 folds were split from).
+1_homology_search.py's best hit against the champion's own training FASTA.
 
-    python pick_fold.py --homology_json homology_champion.json \
+    python 3_pick_fold.py --homology_json homology_champion.json \
         --weights_glob "../weights/ablation/allowed_species_homo_sapiens_fold*.pt" \
         --out_json fold_choice.json --log log
 
-The caller should run this search with a deliberately lenient identity
-threshold (see the Snakefile's fold_avoid_min_seq_id, default 0.80, lower
-than the real-match bar used for ground-truth transfer/matches-listing) --
-even a "somewhat similar" training cluster is reason enough to route around
-whichever fold saw it, rather than requiring near-certainty first.
-
-If the homology search found a training cluster the query overlaps with
-above that threshold, use the one fold whose training split excluded that
-cluster (fold `i`, where `i` is the cluster's fold-group label -- train.py
-trains fold `i` on every record whose label differs from `i`, so fold `i`
-never saw this cluster). That is the only checkpoint guaranteed not to have
-leaked this antigen (or a close homolog of it) into its own training set --
-every one of the *other* 4 folds did train on it, so this is a single-fold
-pick, not an "exclude one, ensemble the rest" average.
-
-If no hit clears that threshold, the query has no detectable overlap with
-any fold's holdout-vs-train split, so no single fold is specially
-"unleaked" -- fall back to the full 5-fold ensemble mean (the same
-"champion ensemble" convention mark_bfactors.py and predict_ensemble.py
-already use elsewhere in this repo).
+If the query overlaps a training cluster above the (lenient) fold-avoidance
+threshold, use the single fold whose training split excluded that cluster
+(fold `i` = the cluster's fold-group label -- the only checkpoint guaranteed
+not to have leaked this antigen or its homologs). Otherwise fall back to the
+full 5-fold ensemble mean.
 """
 from __future__ import annotations
 
@@ -61,7 +45,7 @@ if homology["hit"]:
     weights = [w for w in all_weights if fold_of(w) == fold]
     if not weights:
         raise SystemExit(f"homology hit picked fold {fold}, but no checkpoint in "
-                          f"--weights_glob matches fold{fold} -- {all_weights}")
+                         f"--weights_glob matches fold{fold} -- {all_weights}")
     reason = (f"query overlaps training cluster {homology['header']!r} "
               f"(pident={homology['pident']:.3f}) at/above the fold-avoidance threshold, "
               f"which is held out of fold {fold}'s training set (every other fold trained on "

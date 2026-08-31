@@ -1,39 +1,27 @@
-"""Write a per-residue 'value' column (0-100) from a CSV (pos,aa,value --
-the schema groundtruth_from_homology.py and predict_epitope.py both emit)
-into a structure's B-factor column, for one chain group (or several, e.g.
-a complex with multiple separate antigen copies each scored independently --
-pass --chain/--values_csv more than once, paired in order, to merge them
-all into ONE output file instead of one file per group).
+"""Write a per-residue 'value' column (0-100) from a CSV (pos,aa,value -- the
+schema 2_groundtruth_from_homology.py and 4_predict_epitope.py both emit) into a
+structure's B-factor column, for one chain group or several (pass
+--chain/--values_csv more than once, paired in order, to merge them into ONE
+output file).
 
-    python write_bfactor_structure.py --pdb query.pdb --chain A \
+    python 5_write_bfactor_structure.py --pdb query.pdb --chain A \
         --values_csv prediction.csv --out out.pdb --log log
-    python write_bfactor_structure.py --pdb query.cif --chain A|D \
-        --values_csv prediction.csv --out out.cif --log log
-    python write_bfactor_structure.py --pdb complex.cif \
+    python 5_write_bfactor_structure.py --pdb complex.cif \
         --chain A|D --values_csv groupAD_prediction.csv \
         --chain B|E|O --values_csv groupBEO_prediction.csv \
-        --chain C|F|K --values_csv groupCFK_prediction.csv \
         --out complex_prediction_bfactor.cif --log log
 
---chain accepts a single chain id, or '|'-separated ids for a multi-chain
-antigen (e.g. 'A|D'). Row i of a group's CSV is assigned to residue i of
-that group's concatenated chain walk (chains in the order given) --
-matching load_query()/residue_keys() elsewhere in this pipeline (residue
-identity, from the CSV's 'aa' column, is checked against the structure as a
-guard against a silent misalignment). Groups must not share a chain id.
+Row i of a group's CSV is assigned to residue i of that group's concatenated
+chain walk -- matching load_query()/residue_keys() elsewhere in this pipeline
+(residue identity from the CSV's 'aa' column is checked against the structure
+as a guard against silent misalignment). Groups must not share a chain id.
 
-Dispatches on --pdb's suffix, matching the two existing conventions
-elsewhere in this repo rather than inventing a third:
-  - .pdb: rewrite only B-factor columns (61-66) of the whole file in place
-    (color_by_prediction.py's approach) -- every chain kept (including ones
-    not covered by any group), atoms outside every --chain group zeroed.
-  - .cif: re-serialize via Bio.PDB, restricted to the union of every
-    --chain group (mark_bfactors.py's approach) -- needed for multi-
-    character chain ids, which fixed-column PDB can't represent.
+Dispatches on --pdb's suffix: .pdb rewrites only the B-factor columns of the
+whole file in place (every chain kept; atoms outside every group zeroed);
+.cif re-serializes via Bio.PDB restricted to the union of the groups (needed
+for multi-character chain ids, which fixed-column PDB can't represent).
 
-Must run in the fair-esm environment (epilora/env/bin/python3): the .pdb
-path needs esm.inverse_folding.util (via epitope_pipeline_common) and the
-.cif path needs Bio.PDB.
+Must run in the fair-esm environment (epilora/env/bin/python3).
 """
 from __future__ import annotations
 
@@ -88,6 +76,7 @@ def write_pdb(pdb_path: Path, groups: list[tuple[list[str], list[dict]]], out_pa
 
 
 def write_cif(pdb_path: Path, groups: list[tuple[list[str], list[dict]]], out_path: Path) -> tuple[int, int]:
+    from Bio.Data.PDBData import protein_letters_3to1
     from Bio.PDB import MMCIFIO, MMCIFParser, Select
     from Bio.PDB.Polypeptide import is_aa
 
@@ -105,7 +94,6 @@ def write_cif(pdb_path: Path, groups: list[tuple[list[str], list[dict]]], out_pa
             all_chains.append(chain)
         residues = [res for chain in chains for res in model[chain] if is_aa(res, standard=True)]
         for res, row in zip(residues, rows):
-            from Bio.Data.PDBData import protein_letters_3to1
             expect = protein_letters_3to1.get(res.resname, "X")
             if expect != row["aa"]:
                 raise SystemExit(f"{pdb_path.name} chain {res.get_parent().id} res {res.id}: "
@@ -146,7 +134,7 @@ def main() -> None:
 
     if len(args.chain) != len(args.values_csv):
         raise SystemExit(f"--chain given {len(args.chain)} times but --values_csv {len(args.values_csv)} times "
-                          f"-- they're paired in order and must match")
+                         f"-- they're paired in order and must match")
 
     groups = [(parse_chains(chain), read_value_csv(csv_path))
               for chain, csv_path in zip(args.chain, args.values_csv)]

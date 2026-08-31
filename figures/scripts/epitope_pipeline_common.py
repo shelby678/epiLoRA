@@ -1,20 +1,11 @@
-"""Shared helpers for the generic single-PDB epitope pipeline (Snakefile in
-this directory). Every script below imports from here instead of
-reimplementing structure loading, so all pipeline stages agree on exactly
-the same residue ordering for a given (pdb, chain) -- this is what lets a
-prediction CSV, a homology-transfer CSV and the final B-factor rewrite all
-line up index-for-index without re-deriving the mapping three times.
-
-Structure loading is Bio.PDB-based (PDBParser/MMCIFParser dispatched on
-suffix) -- the same extraction epilora/data.py's load_backbone_coords and
-data/scripts/structures.py use elsewhere in this repo, and handles .pdb and
-.cif uniformly. predict.py's model-loading/inference functions
-(load_model/predict) don't care how coords were produced, so this only
-touches the extraction side.
+"""Shared helpers for the Snakefile's epitope pipeline. Every stage imports
+from here so they all agree on the same residue ordering for a given
+(pdb, chain) -- this is what lets a prediction CSV, a homology-transfer CSV
+and the final B-factor rewrite line up index-for-index.
 
 Must run in the fair-esm environment (epilora/env/bin/python3): needs
-biopython, and, transitively via predict.py, torch/esm if the caller goes
-on to run the model.
+biopython, and, transitively via predict.py, torch/esm if the caller goes on
+to run the model.
 """
 from __future__ import annotations
 
@@ -57,11 +48,8 @@ def default_chain(pdb_path: str) -> str:
 
 
 def parse_chains(chain: str) -> list[str]:
-    """A '|'-separated chain spec (e.g. 'A|D', matching SAbDab's own
-    antigen_chain column convention -- see mark_bfactors.py) into an ordered
-    list of chain ids. A multi-chain antigen (e.g. GP1+GP2 crystallized as
-    separate chains) is treated as one concatenated sequence, in the order
-    given, same as mark_bfactors.py/epilora/data.py's load_backbone_coords."""
+    """A '|'-separated chain spec (e.g. 'A|D') into an ordered list of
+    chain ids -- SAbDab's own antigen_chain column convention."""
     return chain.split("|")
 
 
@@ -74,8 +62,8 @@ def _multi_chain_residues(model, chains: list[str]) -> list:
 
 def load_query(pdb_path: str, chains: list[str]):
     """(coords, seq): (L, 3, 3) N/CA/C backbone coords (NaN where an atom is
-    missing -- model.py tolerates this, same as training data) and the
-    1-letter sequence, concatenated across ``chains`` in order."""
+    missing -- model.py tolerates this) and the 1-letter sequence,
+    concatenated across ``chains`` in order."""
     residues = _multi_chain_residues(load_structure_model(pdb_path), chains)
     seq = "".join(protein_letters_3to1.get(res.resname, "X") for res in residues)
     coords = np.full((len(residues), 3, 3), np.nan, dtype=np.float32)
@@ -88,8 +76,7 @@ def load_query(pdb_path: str, chains: list[str]):
 
 def residue_keys(pdb_path: str, chains: list[str]) -> list[tuple[str, int, str, str]]:
     """(chain_id, res_id, ins_code, res_name) per residue, in the same file
-    order load_query() walks (each residue keeping its own chain id, so a
-    multi-chain antigen's keys still map back onto the right chain)."""
+    order load_query() walks."""
     model = load_structure_model(pdb_path)
     keys = []
     for chain_id in chains:
@@ -115,7 +102,7 @@ def parse_training_fasta(path: str) -> list[tuple[str, str]]:
     """Yield (header, sequence) for a data_prep.smk-style epitope fasta:
     one record per cluster, header's last whitespace-separated field is the
     fold label (e.g. '3.1'), sequence casing carries the epitope call
-    (lowercase = epitope) -- see data/README.md."""
+    (lowercase = epitope)."""
     header, seq = None, []
     for line in Path(path).read_text().splitlines():
         if line.startswith(">"):
@@ -129,7 +116,6 @@ def parse_training_fasta(path: str) -> list[tuple[str, str]]:
 
 
 def fold_group_of(header: str) -> int:
-    """The `i` in a trailing `i.j` fold label -- see data/README.md's Fold
-    label scheme. fold `i`'s checkpoint was trained on every record whose
-    label's `i` differs from this one (train.py: 'fold != --fold')."""
+    """The `i` in a trailing `i.j` fold label: fold `i`'s checkpoint was
+    trained on every record whose label's `i` differs from this one."""
     return int(header.rsplit(" ", 1)[-1].split(".")[0])

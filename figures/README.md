@@ -1,21 +1,18 @@
 # figures
 
-Snakemake pipeline that annotates an arbitrary input structure (not
-necessarily one of ours, not necessarily bound to an antibody) with two
-independent epitope calls, written into the B-factor column so they can be
-loaded straight into PyMOL/ChimeraX and colored by B-factor:
+Snakemake pipeline producing up to three structures carrying epitope calls
+in the B-factor column (for coloring by B-factor in PyMOL/ChimeraX):
 
-- **ground truth by homology** — does this antigen (or something close to
-  it) already have a known epitope in the training data?
-- **epiLoRA's prediction** — using whichever champion checkpoint, if any,
-  is guaranteed not to have trained on something too similar to this query.
+1. query antigen with ground-truth epitope sites (by homology) marked
+2. query antigen with epiLoRA-predicted epitope sites marked
+3. conjoined ground truth: one reference antigen with every surviving
+   antibody's Fv superposed onto it (overlaps OK)
 
-`ebola/`, `scripts/filter_ebola_tsv.py`, `scripts/mark_bfactors.py` and
-`scripts/msa_ebola.py` are an earlier, Ebola-specific one-off analysis (its
-ground truth comes from direct antibody-contact distances within the same
-SAbDab entry, not homology) and aren't part of this Snakefile.
+Every run needs the fair-esm environment (`../epilora/env`, overridable via
+`--config env_python=...`) and `mmseqs` on `PATH` for results 1 & 2; both are
+assumed, not checked.
 
-## Usage
+## 1 & 2. Annotate an arbitrary structure
 
 ```
 snakemake --cores 4 --config input_pdb=/path/to/query.pdb
@@ -23,101 +20,84 @@ snakemake --cores 4 --config input_pdb=/path/to/query.cif chain=A
 snakemake --cores 4 --config input_pdb=complex.cif "chain_groups=A|D;B|E|O;C|F|K"
 ```
 
-`chain` (or each spec inside `chain_groups`) accepts a single chain id, or
-`|`-separated ids for a multi-chain antigen (e.g. `A|D`, concatenated in
-order) — same convention SAbDab's own `antigen_chain` column uses.
-`chain_groups` is for a file holding *several separate* antigen copies
-(e.g. three independent Fv+antigen pairs in one cryo-EM asymmetric unit):
-each group is scored independently, then merged into ONE combined output
-covering every group's chains — not one file per group.
+Produces, in `outdir` (default `results/{stem}_{tag}`):
 
-Every run needs the fair-esm environment (`../epilora/env`) and `mmseqs`
-on `PATH`; both are assumed, not checked.
+- `{tag}_groundtruth_bfactor.{ext}` — epitope-by-homology: unioned across
+  every `train_fasta` hit ≥ `min_seq_id` (lowercase residues in the training
+  fasta mark epitopes)
+- `{tag}_prediction_bfactor.{ext}` — epiLoRA per-residue epitope probability
+
+`chain` (or each spec in `chain_groups`) is one chain id, or `|`-separated
+ids for a multi-chain antigen (SAbDab's `antigen_chain` convention).
+`chain_groups` scores each antigen copy in a multi-copy file independently,
+then merges them into ONE combined output per call.
+
+Per chain group: mmseqs-search the extracted sequence against the training
+corpus (`train_fasta`, → `groundtruth.csv` via union-across-hits) and the
+champion model's training fasta (`champion_fasta`, → `fold_choice.json`: use
+the single fold that never saw this antigen, else the 5-fold ensemble) →
+`prediction.csv`. Then all groups' CSVs merge into the two output
+structures via `5_write_bfactor_structure.py`.
+
+## 3. Conjoined ground-truth structure
+
+```
+snakemake --cores 4 --config conjoined_tsv=ebola/ebola_summary.tsv
+```
+
+Filters the Ebola SAbDab complexes (`conjoined_tsv`: human-only antibody;
+placeable on the 7kfe GP trimer reference without the antibody clashing
+through it, which rejects cryptic epitopes and non-spike antigens;
+non-redundant by binding pose; antigen ≈ the reference antigen) and writes
+`results/conjoined_groundtruth/combined_on_pdb_00006qd8.cif`: one GP trimer
+with every surviving antibody's Fv superposed onto it (overlaps OK), antigen
+B-factors marking the union of all antibody contacts, plus a `_mapping.tsv`
+of antibody chain ids. Runs `6_finalize_groundtruth_structs.py` (which imports
+`chain_residues`/`chain_sequence` from `../data/scripts/structures.py`)
+against `structures_dir` (default `../data/raw/all-structures-extracted`).
+
+`--config input_pdb=... conjoined_tsv=...` builds all three results in one
+run. `ebola/ebola_summary.tsv` is the filtered SAbDab summary
+(`../data/raw/sabdab_summary_all.tsv` restricted to Ebola protein antigens
+with annotated H/L/antigen chains).
 
 ### Config
 
 | key | default | meaning |
 |---|---|---|
-| `input_pdb` | *(required)* | `.pdb` or `.cif` structure to annotate |
+| `input_pdb` | — | `.pdb` or `.cif` structure to annotate (results 1 & 2) |
 | `chain` | first chain in the file | chain(s) for a single group |
-| `chain_groups` | — | `;`-separated chain specs, one per independently-scored antigen copy |
-| `outdir` | `results/{stem}_{tag}` | where output lands |
-| `train_fasta` | `../data/results/epitopes.fasta` | ground-truth-transfer corpus (one row per raw antigen instance — see below for why not `all_epitopes.fasta`) |
-| `champion_fasta` | `../data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta` | champion model's own training fasta, for fold selection |
+| `chain_groups` | — | `;`-separated chain specs, one per antigen copy |
+| `outdir` | `results/{stem}_{tag}` | where results 1 & 2 land |
+| `train_fasta` | `../data/results/epitopes.fasta` | ground-truth-transfer corpus (one row per raw antigen instance — the cluster-collapsed `train_test_eval/*_epitopes.fasta` files can miss a near-exact match that wasn't elected its cluster's representative) |
+| `champion_fasta` | `../data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta` | champion model's training fasta, for fold selection |
 | `champion_weights_glob` | `../weights/ablation/allowed_species_homo_sapiens_fold?.pt` | the 5 per-fold champion checkpoints |
-| `member_fasta` | `../data/train_test_eval/eval/train_clusters.fasta` | per-structure (not per-cluster) corpus, for `matches_members.csv` |
-| `min_seq_id` | `0.95` | identity cutoff for ground-truth transfer and the matches list |
-| `min_aln_len` | `20` | minimum aligned residues (absolute floor, not a length-ratio coverage filter — see below) |
-| `fold_avoid_min_seq_id` | `0.80` | separate, more lenient cutoff used only for fold selection |
-
-## Pipeline
-
-Per chain group:
-
-1. **homology_search** (×3: `train`, `champion`, `members` corpora) —
-   mmseqs2-search the group's extracted sequence against each corpus.
-   Reports the single best hit (`homology_{corpus}.json`), every
-   above-threshold hit ranked best-first (`matches_{corpus}.csv`), and
-   every hit's full alignment mapping (`all_hits_{corpus}.json`).
-2. **groundtruth_from_homology** — unions epitope calls (lowercase in the
-   training fasta) across *every* `train`-corpus hit ≥ `min_seq_id` →
-   `groundtruth.csv`.
-3. **pick_fold** — if any `champion`-corpus hit is ≥ `fold_avoid_min_seq_id`,
-   use the single checkpoint whose training split excluded that cluster
-   (fold `i`, where `i` is the cluster's fold-group label — every *other*
-   fold trained on it); otherwise use the full 5-fold ensemble mean →
-   `fold_choice.json`.
-4. **predict_epitope** — run the checkpoint(s) from step 3 → `prediction.csv`.
-
-Then, across all groups:
-
-5. **combine_groundtruth_structure** / **combine_prediction_structure** —
-   merge every group's CSV into one output structure each, covering every
-   group's chains:
-   `{outdir}/{tag}_groundtruth_bfactor.{ext}`, `..._prediction_bfactor.{ext}`.
-
-## Why two different corpora, two different thresholds
-
-- **`train_fasta` defaults to `data/results/epitopes.fasta`, not
-  `all_epitopes.fasta`.** The `train_test_eval/*_epitopes.fasta` files keep
-  only ONE sequence per 95%-identity cluster (whichever `combine_epitopes.py`
-  elected as that cluster's representative). A query can be a near-exact
-  match to a real SAbDab structure and still miss the search entirely if
-  that particular structure wasn't the one elected — `data/results/
-  epitopes.fasta` (one row per raw, pre-clustering antigen instance) doesn't
-  have that blind spot.
-- **`fold_avoid_min_seq_id` (0.80) is lower than `min_seq_id` (0.95).**
-  Ground-truth transfer needs real confidence before asserting a label.
-  Fold avoidance is cheap insurance — even a "somewhat similar" training
-  cluster is reason enough to route around the one fold that saw it, so
-  this threshold errs lenient.
-- **No mmseqs `-c`/`--cov-mode` length-ratio filter, anywhere.** Those modes
-  (including mode 5, "short seq. needs to be at least x% of the *other*
-  seq. length" in the installed mmseqs version) reject exactly the case we
-  want to allow: a query that's a short subsequence of a much longer
-  training antigen, or vice versa. `min_aln_len` is an absolute residue
-  floor instead, just to keep a coincidental few-residue high-identity
-  stretch from counting as a hit.
+| `min_seq_id` | `0.95` | identity cutoff for ground-truth transfer |
+| `min_aln_len` | `20` | minimum aligned residues (absolute floor, not a coverage-ratio filter — short-subsequence matches should still count) |
+| `fold_avoid_min_seq_id` | `0.80` | more lenient cutoff used only for fold selection |
+| `conjoined_tsv` | — | SAbDab summary TSV to build result 3 from (omit to skip) |
+| `structures_dir` | `../data/raw/all-structures-extracted` | raw SAbDab structures (`<pdb>/<pdb>_sabdab.cif`) |
+| `ref_pdb` / `ref_chains` | `pdb_00007kfe` / `A,B,C,D,E,F` | reference trimer antibodies are placed against |
+| `ref_antigen_pdb` | `pdb_00006qd8` | PDB whose antigen all survivors are superposed onto |
+| `conjoined_outdir` | `results/conjoined_groundtruth` | where result 3 lands |
+| `env_python` | `../epilora/env/bin/python3` | python used inside the rules |
 
 ## Known limitations
 
-- Each chain group is scored as a single concatenated pseudo-chain (matching
-  how the training data itself was built), so contacts that depend on
-  interaction *between* two groups scored separately aren't captured within
-  one group's prediction.
-- `chain_groups` must be told explicitly which chains belong together —
-  there's no automatic detection of "these N chains are one antigen copy."
+- Each chain group is scored as a single concatenated pseudo-chain, so
+  contacts depending on interaction *between* two groups scored separately
+  aren't captured within one group's prediction.
+- `chain_groups` must be told explicitly which chains belong together.
+- Result 3's filters are tuned for Ebola GP (GP1/GP2 protomer pairing, GP2
+  requirement to reject sGP/NP); `6_finalize_groundtruth_structs.py
+  --single_chain_protomer` covers single-chain antigens like a SARS-CoV-2
+  spike, but that mode isn't exposed through the Snakefile.
 
 ## `scripts/`
 
-**Wired into the Snakefile:** `homology_search.py` (also extracts the query
-sequence — folded in from a separate script since every other stage already
-takes `--pdb`/`--chain` directly), `prepare_corpus_db.py` (stages a corpus
-for mmseqs; auto-detects flat vs. `cluster_fasta.py` block format),
-`groundtruth_from_homology.py`, `pick_fold.py`, `predict_epitope.py`,
-`write_bfactor_structure.py` (writes the final B-factor structure; also
-handles merging multiple chain groups into one file). `epitope_pipeline_common.py`
-is shared helpers, not its own rule.
-
-**Not part of this Snakefile** (the earlier Ebola one-off, see above):
-`filter_ebola_tsv.py`, `mark_bfactors.py`, `msa_ebola.py`.
+Numbered by pipeline step: `0_prepare_corpus_db.py`,
+`1_homology_search.py`, `2_groundtruth_from_homology.py`,
+`3_pick_fold.py`, `4_predict_epitope.py`, `5_write_bfactor_structure.py`
+(steps 0-1 run once per corpus, 2-5 per query chain group), and
+`6_finalize_groundtruth_structs.py` (the conjoined structure, an independent
+branch). `epitope_pipeline_common.py` is shared helpers, not a step.

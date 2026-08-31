@@ -1,8 +1,7 @@
 """Run epiLoRA on the query structure using whichever checkpoint(s)
-pick_fold.py selected (a single held-out fold if the query overlapped a
-training cluster, else the full 5-fold champion ensemble), and average.
+3_pick_fold.py selected, and average.
 
-    python predict_epitope.py --pdb query.pdb --chain A \
+    python 4_predict_epitope.py --pdb query.pdb --chain A \
         --fold_choice fold_choice.json --out_csv prediction.csv --log log
 
 Must run in the fair-esm environment (epilora/env/bin/python3).
