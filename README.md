@@ -90,3 +90,27 @@ ranked summary:
 ```bash
 python ablation/run_ablation.py --max-seconds 3600
 ```
+
+### Extra head features
+
+The per-residue head normally reads the ESM-IF1 embedding alone. It can also be
+given scalar per-residue features to weigh alongside it — **relative solvent
+accessibility** (freesasa, computed on the antigen chain(s) with the antibody
+excluded) and **antigen length** (log-scaled, same value for every residue):
+
+```bash
+python train.py --config configs/feats_rsa_length.yaml \
+    --fold 1 --out weights/feats_rsa_length_fold1.pt
+```
+
+That config is a single line — `extra_feats: [rsa, length]` (see
+`TrainConfig`); write it yourself if it isn't there, since `configs/` is
+machine-local. The
+features are appended to the head's input, so the champion's `Linear(512,1)`
+head becomes `Linear(514,1)` and nothing else about the recipe changes. This
+needs `freesasa` installed, and works with `backbone: esmif1`.
+
+Each checkpoint records which features its head expects, so `predict.py`,
+`predict_ensemble.py` and `eval_final.py` recompute them from the structure
+automatically — checkpoints trained without them keep working untouched. RSA is
+cached next to the backbone coordinates (`*_coords_cache/*.rsa.npy`).

@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from predict import load_model, predict as predict_proba
+from predict import extra_feats_for, load_model, predict as predict_proba
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHAMPION_WEIGHTS = sorted(
@@ -41,13 +41,13 @@ CHAMPION_WEIGHTS = sorted(
 
 
 @torch.no_grad()
-def ensemble_probs(models, coords, seq) -> tuple[np.ndarray, np.ndarray]:
+def ensemble_probs(models, coords, seq, feats=None) -> tuple[np.ndarray, np.ndarray]:
     """Per-residue epitope probability averaged over ``models``.
 
     Returns (mean, std) across the ensemble members; the std is a cheap
     fold-to-fold agreement signal, not a calibrated uncertainty.
     """
-    stack = np.stack([predict_proba(m, coords, seq) for m in models])
+    stack = np.stack([predict_proba(m, coords, seq, feats) for m in models])
     return stack.mean(axis=0), stack.std(axis=0)
 
 
@@ -78,6 +78,10 @@ def main() -> None:
     for w in args.weights:
         print(f"[ensemble]   {w}", file=sys.stderr)
     models = [load_model(w, device) for w in args.weights]
+    feat_names = {m.extra_feats for m in models}
+    if len(feat_names) > 1:
+        p.error("cannot ensemble checkpoints whose heads read different extra features: "
+                + "; ".join(str(sorted(f)) for f in feat_names))
 
     if args.out_dir is not None:
         args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -93,7 +97,8 @@ def main() -> None:
             if chain not in all_chains:
                 p.error(f"chain {chain!r} not found in {pdb.name} (chains present: {', '.join(all_chains)})")
             coords, seq = ifu.extract_coords_from_structure(structure[structure.chain_id == chain])
-            mean, std = ensemble_probs(models, coords, seq)
+            feats = extra_feats_for(models[0], pdb, chain, seq)
+            mean, std = ensemble_probs(models, coords, seq, feats)
             called = int((mean >= args.threshold).sum())
             print(f"\n# {pdb.name} chain {chain}: {len(seq)} residues, "
                   f"{called} called epitope at p>={args.threshold} "

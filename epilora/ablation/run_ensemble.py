@@ -53,14 +53,14 @@ def ensemble_probs(models, samples, device) -> tuple[np.ndarray, np.ndarray]:
     """Average sigmoid probs across ``models`` for every structure-backed sample."""
     probs_by_model = [[] for _ in models]
     labels_all = []
-    for header, seq, labels, coords in samples:
-        if coords is None:
+    for header, seq, labels, coords, feats in samples:
+        if coords is None or (feats is None and models[0].n_extra_feats):
             continue
         ok = True
         per_model = []
         for m in models:
             try:
-                logits = m([coords], [seq])[0].cpu().numpy()
+                logits = m([coords], [seq], [feats])[0].cpu().numpy()
             except Exception:
                 ok = False
                 break
@@ -177,7 +177,8 @@ def main() -> None:
         for ef, by_part in eval_by_fasta.items():
             name = eval_name(ef)
             test_entries = by_part.get(f"{fold}.1", [])
-            samples = load_samples(test_entries, args.structures)
+            samples = load_samples(test_entries, args.structures,
+                                   extra_feats=models[0].extra_feats)
             y, stacked = ensemble_probs(models, samples, args.device)
             if y.size == 0 or len(np.unique(y)) < 2:
                 row[f"single_auc_mean_{name}"] = row[f"single_auc_std_{name}"] = row[f"ensemble_auc_{name}"] = ""

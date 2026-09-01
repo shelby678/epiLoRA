@@ -35,11 +35,16 @@ def predict_all(models, samples, device):
     """Return (headers, seqs, labels_list, probs_list) -- ``probs_list[i]``
     averaged sigmoid across ``models`` for sample i."""
     headers, seqs, labels_list, probs_list = [], [], [], []
-    for header, seq, labels, coords in samples:
+    for header, seq, labels, coords, feats in samples:
         if coords is None:
             raise ValueError(f"no usable backbone coordinates for {header!r} -- "
                              "every eval-set antigen must be scorable for a fair comparison")
-        per_model = [1.0 / (1.0 + np.exp(-m([coords], [seq])[0].cpu().numpy())) for m in models]
+        if feats is None and models[0].n_extra_feats:
+            raise ValueError(f"could not build head features {models[0].extra_feats} for "
+                             f"{header!r} -- every eval-set antigen must be scorable for a "
+                             "fair comparison")
+        per_model = [1.0 / (1.0 + np.exp(-m([coords], [seq], [feats])[0].cpu().numpy()))
+                     for m in models]
         headers.append(header)
         seqs.append(seq)
         labels_list.append(labels)
@@ -60,11 +65,15 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     models = [load_model(w, device) for w in args.weights]
+    feat_names = {m.extra_feats for m in models}
+    if len(feat_names) > 1:
+        raise SystemExit("cannot ensemble checkpoints whose heads read different extra "
+                         "features: " + "; ".join(str(sorted(f)) for f in feat_names))
 
     by_part = parse_fasta(args.eval_fasta)
     entries = [e for v in by_part.values() for e in v]
-    samples = load_samples(entries, args.structures)
-    n_struct = sum(1 for *_, c in samples if c is not None)
+    samples = load_samples(entries, args.structures, extra_feats=models[0].extra_feats)
+    n_struct = sum(1 for s in samples if s[3] is not None)
     print(f"eval.fasta: {len(entries)} records, {n_struct} with usable structure")
 
     headers, seqs, labels_list, probs_list = predict_all(models, samples, device)

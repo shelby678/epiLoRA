@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from data import EXTRA_FEATURE_NAMES, extra_feats_width
+
 # fair-esm's esm.inverse_folding.util imports biotite.structure.filter_backbone,
 # which newer biotite (>=1.0) renamed to filter_peptide_backbone.
 import biotite.structure as _struc
@@ -127,11 +129,16 @@ class EpitopeModel(nn.Module):
     every backbone.
     """
 
-    def _init_head(self, hidden: int, dropout: float, head_dim: int | None) -> None:
+    def _init_head(self, hidden: int, dropout: float, head_dim: int | None,
+                   extra_feats=()) -> None:
+        """Build the per-residue head over ``hidden`` backbone dims plus the
+        inputs contributed by ``extra_feats`` (see data.EXTRA_FEATURE_WIDTHS)."""
         self.hidden = hidden
+        self.extra_feats = tuple(extra_feats)
+        self.n_extra_feats = extra_feats_width(self.extra_feats)  # also validates names
         self.head_ln = nn.LayerNorm(hidden)
         self.head_drop = nn.Dropout(dropout)
-        self.head = build_head(hidden, head_dim, dropout)
+        self.head = build_head(hidden + self.n_extra_feats, head_dim, dropout)
 
     @property
     def device(self):
@@ -140,13 +147,30 @@ class EpitopeModel(nn.Module):
     def _encode(self, coords_batch, seq_batch):
         raise NotImplementedError
 
-    def forward(self, coords_batch, seq_batch):
-        """Return a list of per-residue logit tensors, one per input protein."""
+    def forward(self, coords_batch, seq_batch, feats_batch=None):
+        """Return a list of per-residue logit tensors, one per input protein.
+
+        ``feats_batch`` supplies the extra head features (one (L,
+        n_extra_feats) array per protein, see data.build_extra_feats) when the
+        model was built with any.
+        """
         hidden = self._encode(coords_batch, seq_batch)
         out = []
         for b in range(len(seq_batch)):
             L = len(seq_batch[b])
             h = self.head_drop(self.head_ln(hidden[b, 1:L + 1]))  # drop begin token
+            if self.n_extra_feats:
+                if feats_batch is None or feats_batch[b] is None:
+                    raise ValueError(
+                        f"this model's head reads extra features {self.extra_feats}, so "
+                        f"forward() needs a feats_batch (see data.build_extra_feats)")
+                f = torch.as_tensor(np.asarray(feats_batch[b]), dtype=h.dtype, device=h.device)
+                if f.shape != (L, self.n_extra_feats):
+                    raise ValueError(f"expected features of shape {(L, self.n_extra_feats)} "
+                                     f"for {self.extra_feats}, got {tuple(f.shape)}")
+                # Concatenated after LayerNorm+dropout, so raw feature scales
+                # survive and no feature is ever dropped out.
+                h = torch.cat([h, f], dim=-1)
             out.append(self.head(h).squeeze(-1))
         return out
 
@@ -169,23 +193,29 @@ class EpitopeModel(nn.Module):
 
 
 class ESMIF1EpitopeModel(EpitopeModel):
-    """Frozen ESM-IF1 + LoRA + RYS + per-residue epitope head."""
+    """Frozen ESM-IF1 + LoRA + RYS + per-residue epitope head.
+
+    ``extra_feats`` optionally adds per-residue head inputs on top of the
+    512-d encoder embedding -- see data.build_extra_feats. The "aa" one-hot
+    matters more than it looks: the encoder reads backbone geometry only, so
+    without it the model is sequence-blind.
+    """
 
     def __init__(self, esm_model, alphabet, rank=4, alpha=8.0,
                  n_lora_layers=8, rys_start=4, rys_end=8,
-                 dropout=0.1, head_dim=None):
+                 dropout=0.1, head_dim=None, extra_feats=()):
         super().__init__()
         self.esm = esm_model
         self.alphabet = alphabet
         self._cfg = dict(rank=rank, alpha=alpha, n_lora_layers=n_lora_layers,
                          rys_start=rys_start, rys_end=rys_end, dropout=dropout,
-                         head_dim=head_dim)
+                         head_dim=head_dim, extra_feats=list(extra_feats))
         for p in self.esm.parameters():
             p.requires_grad = False
         inject_lora_layers(self.esm.encoder.layers, rank, alpha, n_lora_layers)
         if rys_end > rys_start:
             patch_encoder_rys(self.esm.encoder, rys_start, rys_end)
-        self._init_head(HIDDEN, dropout, head_dim)
+        self._init_head(HIDDEN, dropout, head_dim, extra_feats)
 
     def _encode(self, coords_batch, seq_batch):
         # Stock fair-esm inverse-folding collate (pads coords, builds mask/confidence).
@@ -209,7 +239,7 @@ def build_model(device: str = "cpu", **cfg) -> "ESMIF1EpitopeModel":
     """Build an (untrained) epiLoRA model on ``device``.
 
     ``cfg`` overrides the champion defaults (rank, alpha, n_lora_layers,
-    rys_start, rys_end, dropout).
+    rys_start, rys_end, dropout, head_dim, extra_feats).
     """
     esm_model, alphabet = load_base_esmif1()
     model = ESMIF1EpitopeModel(esm_model, alphabet, **cfg).to(device)
@@ -477,6 +507,10 @@ def build_model_esmc(device: str = "cpu", size: str = "600M", rank: int = 4, alp
 
 PROSTT5_HIDDEN = 1024
 PROSTT5_N_LAYERS = 24
+
+# ProtT5: same T5-encoder wrapper, plain protein-LM weights instead of
+# ProstT5's AA<->3Di ones. Size -> HF name.
+PROTT5_NAMES = {"xl": "Rostlab/prot_t5_xl_half_uniref50-enc"}
 
 
 def inject_lora_t5(blocks, rank: int, alpha: float, n_layers: int) -> None:

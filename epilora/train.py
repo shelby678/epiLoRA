@@ -12,7 +12,7 @@ label ``i.j`` (see ``data/README.md``); ``--fold i`` trains on every record
 whose fold != i.
 
 Every hyperparameter/backbone axis (LoRA rank/alpha/layers, RYS window, head
-dim, dropout, backbone) lives in the ``TrainConfig`` dataclass below, not
+dim, dropout, backbone, extra head features) lives in the ``TrainConfig`` dataclass below, not
 on the CLI directly: ``--config`` points at one of the named ablations under
 ``configs/`` (default: none, i.e. the champion recipe, ``TrainConfig()``'s
 own field defaults). ``--max-seconds``/``--eval-fastas``/``--wandb*`` are the
@@ -75,9 +75,10 @@ class TrainConfig:
     Job-identity args (--fasta/--structures/--out/--fold/--seed) are not part
     of this config; they stay plain train.py flags.
     """
-    backbone: str = "esmif1"           # esmif1, esm2, esm3, or esmc
+    backbone: str = "esmif1"           # esmif1, esm2, esm3, esmc, prostt5, or prott5
     esm2_size: str = "650M"            # 35M, 150M, or 650M (only used when backbone=esm2)
     esmc_size: str = "600M"            # 300M or 600M (only used when backbone=esmc)
+    prott5_size: str = "xl"            # only used when backbone=prott5 (see model.PROTT5_NAMES)
     lora_rank: int = 4
     lora_alpha: float = 8.0
     lora_layers: int = 8               # number of top transformer layers to adapt with LoRA
@@ -85,6 +86,9 @@ class TrainConfig:
     rys_end: int = 8                   # replay window end, exclusive; rys_end<=rys_start disables RYS
     head_dim: Optional[int] = None     # if set, MLP head Linear(hidden,head_dim)-GELU-Linear(.,1)
     dropout: float = 0.1               # dropout applied in the head (and MLP hidden layer, if used)
+    # Extra per-residue head inputs (e.g. ["rsa", "length"]); see
+    # data.EXTRA_FEATURE_NAMES. Empty = the champion head.
+    extra_feats: list[str] = dataclasses.field(default_factory=list)
     max_seconds: int = 14400
     eval_fastas: list[Path] = dataclasses.field(default_factory=lambda: [
         REPO_ROOT / "data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta",
@@ -122,21 +126,29 @@ def load_config(path: Path | None) -> TrainConfig:
     return cfg
 
 
+def usable(model, sample) -> bool:
+    """Does this sample have what the model needs to score it -- coords, plus
+    extra head features if the model's head reads any?"""
+    coords, feats = sample[3], sample[4]
+    return coords is not None and (feats is not None or not model.n_extra_feats)
+
+
 @torch.no_grad()
 def evaluate_auc(model, samples) -> float:
     model.eval()
     logits_all, labels_all = [], []
-    for header, seq, labels, coords in samples:
-        if coords is None:
+    for sample in samples:
+        header, seq, labels, coords, feats = sample
+        if not usable(model, sample):
             continue
         try:
-            lg = model([coords], [seq])[0].cpu().numpy()
+            lg = model([coords], [seq], [feats])[0].cpu().numpy()
         except Exception as e:
             raise RuntimeError(f"evaluate_auc: forward pass failed on {header!r}: {e}") from e
         logits_all.append(lg)
         labels_all.append(labels)
     if not logits_all:
-        raise RuntimeError(f"evaluate_auc: no structure-backed samples among {len(samples)} given")
+        raise RuntimeError(f"evaluate_auc: no scorable samples among {len(samples)} given")
     y, s = np.concatenate(labels_all), np.concatenate(logits_all)
     return float(roc_auc_score(y, s)) if len(np.unique(y)) >= 2 else float("nan")
 
@@ -168,11 +180,11 @@ def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42, w
         for idx in idxs:
             if time.time() - start >= max_seconds:
                 break
-            header, seq, labels, coords = train_samples[idx]
-            if coords is None:
+            header, seq, labels, coords, feats = train_samples[idx]
+            if not usable(model, train_samples[idx]):
                 continue
             try:
-                logits = model([coords], [seq])[0]
+                logits = model([coords], [seq], [feats])[0]
             except Exception as e:
                 n_skipped += 1
                 logger.warning(f"train: skip {header}: {e}")
@@ -283,11 +295,18 @@ def main() -> None:
     if not val_entries:
         p.error(f"no '{val_label}' records in {cfg.eval_fastas[0]}")
 
+    if cfg.extra_feats and cfg.backbone != "esmif1":
+        # Only the ESM-IF1 builder takes extra_feats so far -- fail loudly
+        # rather than silently training without them.
+        p.error(f"extra_feats={cfg.extra_feats} is only wired for backbone=esmif1, "
+                f"not {cfg.backbone!r}")
+
     logger.info(f"Loading structures ({DEVICE}) ...")
-    train_samples = load_samples(train_entries, args.structures)
-    val_samples = load_samples(val_entries, args.structures)
-    n_tr = sum(1 for *_, c in train_samples if c is not None)
-    n_va = sum(1 for *_, c in val_samples if c is not None)
+    load_kwargs = dict(extra_feats=cfg.extra_feats)
+    train_samples = load_samples(train_entries, args.structures, **load_kwargs)
+    val_samples = load_samples(val_entries, args.structures, **load_kwargs)
+    n_tr = sum(1 for s in train_samples if s[3] is not None)
+    n_va = sum(1 for s in val_samples if s[3] is not None)
     logger.info(f"fold={args.fold}  train={len(train_samples)} ({n_tr} w/ struct)  "
                 f"val={len(val_samples)} ({n_va} w/ struct)")
     if n_tr == 0:
@@ -296,7 +315,8 @@ def main() -> None:
     if cfg.backbone == "esmif1":
         model = build_model(device=DEVICE, rank=cfg.lora_rank, alpha=cfg.lora_alpha,
                             n_lora_layers=cfg.lora_layers, rys_start=cfg.rys_start,
-                            rys_end=cfg.rys_end, dropout=cfg.dropout, head_dim=cfg.head_dim)
+                            rys_end=cfg.rys_end, dropout=cfg.dropout, head_dim=cfg.head_dim,
+                            extra_feats=cfg.extra_feats)
     elif cfg.backbone == "esm2":
         from model import build_model_esm2
         model = build_model_esm2(device=DEVICE, size=cfg.esm2_size, rank=cfg.lora_rank,
@@ -307,11 +327,24 @@ def main() -> None:
         model = build_model_esm3(device=DEVICE, rank=cfg.lora_rank, alpha=cfg.lora_alpha,
                                  n_lora_layers=cfg.lora_layers, dropout=cfg.dropout,
                                  head_dim=cfg.head_dim)
-    else:
+    elif cfg.backbone == "esmc":
         from model import build_model_esmc
         model = build_model_esmc(device=DEVICE, size=cfg.esmc_size, rank=cfg.lora_rank,
                                  alpha=cfg.lora_alpha, n_lora_layers=cfg.lora_layers,
                                  dropout=cfg.dropout, head_dim=cfg.head_dim)
+    elif cfg.backbone in ("prostt5", "prott5"):
+        # Both are the same frozen-T5-encoder wrapper; only the pretrained
+        # weights differ (see model.PROTT5_NAMES).
+        from model import build_model_prostt5, PROTT5_NAMES
+        name = ("Rostlab/ProstT5" if cfg.backbone == "prostt5"
+                else PROTT5_NAMES[cfg.prott5_size])
+        model = build_model_prostt5(device=DEVICE, name=name, rank=cfg.lora_rank,
+                                    alpha=cfg.lora_alpha, n_lora_layers=cfg.lora_layers,
+                                    dropout=cfg.dropout, head_dim=cfg.head_dim)
+    else:
+        # Previously this was the esmc fallback, so a typo'd or unsupported
+        # backbone silently trained an ESMc model instead of erroring.
+        p.error(f"unknown backbone {cfg.backbone!r}")
     t0 = time.time()
     res = train(model, train_samples, val_samples, cfg.max_seconds, seed=args.seed, wandb_run=wandb_run)
     logger.info(f"Done: best val_auc={res['best_auc']:.4f} steps={res['steps']} "
@@ -320,7 +353,7 @@ def main() -> None:
     test_aucs = {}
     for ef, by_part_eval in eval_by_fasta.items():
         test_entries = by_part_eval.get(test_label)
-        test_samples = load_samples(test_entries, args.structures)
+        test_samples = load_samples(test_entries, args.structures, **load_kwargs)
         test_aucs[eval_name(ef)] = evaluate_auc(model, test_samples)
     for name, auc in test_aucs.items():
         logger.info(f"test_auc[{name}]={auc:.4f}")

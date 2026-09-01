@@ -46,7 +46,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "epilora"))
 
-from data import parse_fasta, load_samples  # noqa: E402
+from data import parse_fasta, load_samples, swap_sequence_feats  # noqa: E402
 from predict import load_model  # noqa: E402
 
 # 20 standard amino acids, alphabetical -- this fixed order defines the
@@ -63,10 +63,16 @@ WEIGHTS = sorted(
 
 
 @torch.no_grad()
-def ensemble_probs_batched(models, coords, seq_batch, batch_size: int) -> np.ndarray:
+def ensemble_probs_batched(models, coords, seq_batch, batch_size: int, feats=None,
+                           extra_feats=()) -> np.ndarray:
     """Run each model on a batch of sequences that all share the same backbone
     coords (single-site substitutions of one parent), averaging sigmoid
     probabilities across the ensemble.
+
+    ``coords`` and the parent's structural feature lanes (rsa, length) are
+    shared across the batch (a substitution leaves the backbone untouched);
+    the sequence-dependent lanes are rebuilt per mutant by
+    swap_sequence_feats.
 
     Returns ``(len(seq_batch), L)`` -- per-residue epitope probability, where
     L is the parent sequence length.
@@ -76,9 +82,11 @@ def ensemble_probs_batched(models, coords, seq_batch, batch_size: int) -> np.nda
     for start in range(0, n, batch_size):
         chunk_seqs = list(seq_batch[start:start + batch_size])
         coords_batch = [coords] * len(chunk_seqs)
+        feats_batch = (None if feats is None else
+                       [swap_sequence_feats(extra_feats, feats, s) for s in chunk_seqs])
         per_model = []
         for m in models:
-            logits_list = m(coords_batch, chunk_seqs)
+            logits_list = m(coords_batch, chunk_seqs, feats_batch)
             probs = np.stack(
                 [1.0 / (1.0 + np.exp(-lg.cpu().numpy())) for lg in logits_list]
             )
@@ -200,8 +208,8 @@ def main() -> None:
     print(f"[scan] parsing {args.eval_fasta.name}...", file=sys.stderr)
     by_part = parse_fasta(args.eval_fasta)
     entries = [e for v in by_part.values() for e in v]
-    samples = load_samples(entries, args.structures)
-    n_struct = sum(1 for *_, c in samples if c is not None)
+    samples = load_samples(entries, args.structures, extra_feats=models[0].extra_feats)
+    n_struct = sum(1 for s in samples if s[3] is not None)
     print(f"[scan] {len(samples)} eval sequences, {n_struct} with usable structure",
           file=sys.stderr)
 
@@ -213,19 +221,25 @@ def main() -> None:
     per_sub_rows = []  # for per_substitution.csv
     total_subs = 0
 
-    for si, (header, seq, labels, coords) in enumerate(samples, start=1):
+    for si, (header, seq, labels, coords, feats) in enumerate(samples, start=1):
         instance = header.split()[0]
         if coords is None:
             raise ValueError(
                 f"no usable backbone coordinates for {header!r} -- every eval-set "
                 f"antigen must be scorable for a fair comparison"
             )
+        if feats is None and models[0].n_extra_feats:
+            raise ValueError(
+                f"could not build head features {models[0].extra_feats} for {header!r} -- "
+                f"every eval-set antigen must be scorable for a fair comparison"
+            )
         seq = seq.upper()
         L = len(seq)
 
         # Per-residue epitope probability on the parent (un-mutated) sequence,
         # averaged across the ensemble. Used as the baseline for every delta.
-        base_probs = ensemble_probs_batched(models, coords, [seq], args.batch_size)[0]
+        base_probs = ensemble_probs_batched(models, coords, [seq], args.batch_size, feats,
+                                            models[0].extra_feats)[0]
 
         epi_sites = [i for i, lab in enumerate(labels) if lab == 1]
         # Skip sites whose original residue is non-standard (X, B, Z, U, O, *) --
@@ -250,7 +264,8 @@ def main() -> None:
             s[pos] = sub_aa
             sub_seqs.append("".join(s))
 
-        sub_probs = ensemble_probs_batched(models, coords, sub_seqs, args.batch_size)
+        sub_probs = ensemble_probs_batched(models, coords, sub_seqs, args.batch_size, feats,
+                                           models[0].extra_feats)
 
         for k, (pos, sub_aa) in enumerate(mutations):
             orig_aa = seq[pos]

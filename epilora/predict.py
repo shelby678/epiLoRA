@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from data import build_extra_feats, rsa_for_structure_file
 from model import ESMIF1EpitopeModel, load_base_esmif1
 
 
@@ -40,7 +41,7 @@ def load_model(weights: Path, device: str) -> nn.Module:
         from model import ESM3EpitopeModel, load_base_esm3
         esm_model = load_base_esm3()
         model = ESM3EpitopeModel(esm_model, **cfg).to(device)
-    elif backbone == "prostt5":
+    elif backbone in ("prostt5", "prott5"):
         from model import ProstT5EpitopeModel, load_base_prostt5
         t5_model, tokenizer = load_base_prostt5(cfg["name"])
         model = ProstT5EpitopeModel(t5_model, tokenizer, **cfg).to(device)
@@ -54,9 +55,22 @@ def load_model(weights: Path, device: str) -> nn.Module:
 
 
 @torch.no_grad()
-def predict(model: ESMIF1EpitopeModel, coords, seq) -> np.ndarray:
-    logits = model([coords], [seq])[0].cpu().numpy()
+def predict(model: ESMIF1EpitopeModel, coords, seq, feats=None) -> np.ndarray:
+    """``feats`` is the (L, n) extra head-feature matrix (see extra_feats_for),
+    required only for a checkpoint whose head reads extra features."""
+    logits = model([coords], [seq], None if feats is None else [feats])[0].cpu().numpy()
     return 1.0 / (1.0 + np.exp(-logits))  # sigmoid -> per-residue probability
+
+
+def extra_feats_for(model, structure_path: Path, chain: str, seq: str):
+    """The extra per-residue head features ``model`` needs for this chain, or
+    None if its head reads the embedding alone. RSA is computed on the given
+    chain alone, matching training -- so pass an antigen structure."""
+    if not model.n_extra_feats:
+        return None
+    rsa = (rsa_for_structure_file(structure_path, [chain], len(seq))
+           if "rsa" in model.extra_feats else None)
+    return build_extra_feats(model.extra_feats, seq, rsa)
 
 
 def main() -> None:
@@ -86,7 +100,11 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     coords, seq = load_coords(str(args.pdb), chain)
     model = load_model(args.weights, device)
-    probs = predict(model, coords, seq)
+    feats = extra_feats_for(model, args.pdb, chain, seq)
+    if feats is not None:
+        print(f"[predict] head reads extra features: {', '.join(model.extra_feats)}",
+              file=sys.stderr)
+    probs = predict(model, coords, seq, feats)
 
     print(f"# {args.pdb} chain {chain}: {len(seq)} residues  (val_auc-trained model)")
     print("pos\taa\tprob\tepitope")

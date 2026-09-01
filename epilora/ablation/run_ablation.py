@@ -4,22 +4,28 @@ pair listed in ``ablation_list.csv``.
     python ablation/run_ablation.py --max-seconds 3600
 
 The sweep is defined by ``--list`` (default ``ablation/ablation_list.csv``),
-a CSV with columns ``name,dataset,model``:
+a CSV with columns ``name,dataset,model,config`` (``config`` optional):
 
-    name                                   dataset                                              model
-    all_esmif1                             all_epitopes.fasta                                  esmif1
-    allowed_species_homo_sapiens_min_resolution_10_esm2_650M   allowed_species_homo_sapiens_min_resolution_10_epitopes.fasta   esm2_650M
+    name             dataset                          model      config
+    all_esmif1       all_epitopes.fasta               esmif1
+    feats_mr5        min_resolution_5_epitopes.fasta  esmif1     feats_rsa_length.yaml
+    rys_none_mr5     min_resolution_5_epitopes.fasta  esmif1     rys_none.yaml
 
 - ``dataset`` is a filename in ``--tte-dir``.
-- ``model`` is ``esmif1``, ``esm3``, or ``<esm2|esmc>_<size>`` (e.g. ``esm2_650M``).
-  The matching ``configs/backbone_<model>.yaml`` is generated on first use if
-  it doesn't already exist -- nothing needs to be hand-authored in
-  ``configs/`` before adding a new model to the list.
+- ``model`` is ``esmif1``, ``esm3``, or ``<esm2|esmc>_<size>`` (e.g. ``esm2_650M``);
+  the matching ``configs/backbone_<model>.yaml`` is generated on first use.
+- ``config`` (empty = derived from ``model``) points at a named recipe ablation
+  under ``epilora/configs/`` (or an absolute path) for rows that vary a training
+  axis ``model`` can't express -- extra head features, RYS off, ... (see
+  ``ablation_list_feats_rys.csv``). ``model`` still picks the training env.
 
-If ``--list`` doesn't exist yet, it's generated: every dataset found under
+If ``--list`` doesn't exist yet, it's generated: every dataset under
 ``--tte-dir`` paired with ``esmif1``, plus the homo-sapiens/min-resolution-10
-dataset paired with every other model -- then written out so it can be
-hand-edited and reused.
+dataset paired with every other model -- then written out to be hand-edited.
+
+Jobs whose weights + metrics already exist under ``--weights-dir`` are
+skipped, with their cached metrics recorded in ``--results`` -- so a list can
+be re-run any time to fill in only what's missing (``--force`` to retrain).
 
 For every row x fold this shells out to ``train.py`` (so a crashed run
 doesn't take down the sweep), spreading jobs across all visible GPUs. Every
@@ -30,15 +36,15 @@ ablations -- so the ranking at the end answers "which training recipe
 predicts human epitopes best," not "which recipe looks best on its own
 idiosyncratic test split."
 
-Results land incrementally in ``--results`` (CSV, one row per sweep-row/fold)
+Results land in ``--results`` (one row per sweep-row/fold, updated in place)
 and per-job logs in ``--log-dir``; a ranked summary prints at the end (and
-can be reprinted any time from an existing CSV with ``--summarize-only``).
+can be reprinted with ``--summarize-only``).
 
-Pass ``--slurm`` to submit every job to Slurm (via ``sbatch ablation/slurm_job.sh``)
-instead of running locally across this machine's GPUs -- use this when the
-GPUs live on a separate cluster/machine. Submission just fires off the jobs;
-results/weights land wherever your ``.env``'s ``sync_job_dir()`` ships them,
-so aggregate with ``--summarize-only`` once they've synced back.
+Pass ``--slurm`` to submit every job to Slurm (via ``sbatch
+ablation/slurm_job.sh``) instead of running locally across this machine's
+GPUs -- use when the GPUs live on a separate cluster/machine. Results/weights
+land wherever your ``.env``'s ``sync_job_dir()`` ships them; aggregate with
+``--summarize-only`` once they've synced back.
 """
 from __future__ import annotations
 
@@ -68,7 +74,7 @@ CONFIGS_DIR = EPILORA_DIR / "configs"
 DEFAULT_MODELS = ("esm2_35M", "esm2_150M", "esm2_650M", "esm3", "esmc_300M", "esmc_600M")
 DEFAULT_MULTI_MODEL_DATASET = "allowed_species_homo_sapiens_min_resolution_10_epitopes.fasta"
 
-LIST_FIELDS = ["name", "dataset", "model"]
+LIST_FIELDS = ["name", "dataset", "model", "config"]
 CSV_FIELDS = ["name", "dataset", "model", "fold", "val_auc",
               *[f"test_auc_{b}" for b in BENCHMARKS], "steps", "seconds", "status"]
 
@@ -100,7 +106,9 @@ def config_for_model(model: str) -> Path | None:
         m = _MODEL_RE.match(model)
         if not m:
             raise ValueError(f"unrecognized model {model!r} "
-                              "(expected esmif1, esm3, esm2_<size>, or esmc_<size>)")
+                              "(expected esmif1, esm3, esm2_<size>, or esmc_<size>; "
+                              "for other backbones or recipe ablations, set the row's "
+                              "config column to a configs/*.yaml)")
         cfg = {"backbone": m["backbone"], f"{m['backbone']}_size": m["size"]}
 
     path = CONFIGS_DIR / f"backbone_{model}.yaml"
@@ -111,6 +119,25 @@ def config_for_model(model: str) -> Path | None:
     return path
 
 
+def row_config_path(row: dict) -> Path | None:
+    """The row's optional `config` column as a Path (under epilora/configs/,
+    or absolute), or None if absent/empty."""
+    name = (row.get("config") or "").strip()
+    if not name:
+        return None
+    path = Path(name)
+    return path if path.is_absolute() else CONFIGS_DIR / path
+
+
+def config_for_row(row: dict) -> Path | None:
+    """train.py's --config for a sweep row (None = the esmif1 champion): the
+    row's `config` column when set, else derived from `model`."""
+    explicit = row_config_path(row)
+    if explicit is not None:
+        return explicit
+    return config_for_model(row["model"])
+
+
 def discover_datasets(tte_dir: Path) -> list[Path]:
     return sorted(tte_dir.glob("*_epitopes.fasta"))
 
@@ -119,12 +146,13 @@ def generate_default_list(tte_dir: Path) -> list[dict]:
     rows = []
     for dataset in discover_datasets(tte_dir):
         stem = dataset.stem.removesuffix("_epitopes")
-        rows.append({"name": f"{stem}_esmif1", "dataset": dataset.name, "model": "esmif1"})
+        rows.append({"name": f"{stem}_esmif1", "dataset": dataset.name, "model": "esmif1",
+                     "config": ""})
 
     special_stem = Path(DEFAULT_MULTI_MODEL_DATASET).stem.removesuffix("_epitopes")
     for model in DEFAULT_MODELS:
         rows.append({"name": f"{special_stem}_{model}", "dataset": DEFAULT_MULTI_MODEL_DATASET,
-                     "model": model})
+                     "model": model, "config": ""})
     return rows
 
 
@@ -165,12 +193,57 @@ def wandb_run_name(job_name: str) -> str:
     return f"{job_name}_{job_id}" if job_id else job_name
 
 
+def result_row(row: dict, fold: int, status: str, metrics_path: Path) -> dict:
+    """A --results CSV row for one (sweep-row, fold), filled from the job's
+    metrics.json when it exists (blank on failure)."""
+    out_row = {"name": row["name"], "dataset": row["dataset"], "model": row["model"],
+               "fold": fold, "val_auc": "", "steps": "", "seconds": "", "status": status}
+    for b in BENCHMARKS:
+        out_row[f"test_auc_{b}"] = ""
+    if metrics_path.exists():
+        m = json.loads(metrics_path.read_text())
+        out_row["val_auc"] = m["val_auc"]
+        out_row["steps"] = m["steps"]
+        out_row["seconds"] = m["seconds"]
+        for b in BENCHMARKS:
+            out_row[f"test_auc_{b}"] = m["test_auc"].get(b, "")
+    return out_row
+
+
+def record_result(out_row: dict, csv_lock, csv_path: Path) -> None:
+    """Upsert out_row into --results, one row per (name, fold), so re-runs
+    update in place instead of double-counting in summarize()."""
+    with csv_lock:
+        rows = []
+        if csv_path.exists():
+            with open(csv_path, newline="") as f:
+                rows = [r for r in csv.DictReader(f)
+                        if not (r["name"] == out_row["name"] and int(r["fold"]) == out_row["fold"])]
+        rows.append(out_row)
+        rows.sort(key=lambda r: (r["name"], int(r["fold"])))
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            w.writeheader()
+            w.writerows(rows)
+
+
 def run_job(row: dict, fold: int, gpu_id: int, args, csv_lock, csv_path) -> None:
     name, dataset_name, model = row["name"], row["dataset"], row["model"]
     dataset = (args.tte_dir / dataset_name).resolve()
     out = (args.weights_dir / f"{name}_fold{fold}.pt").resolve()
     log_path = args.log_dir / f"{name}_fold{fold}.log"
     job_name = f"{name}_fold{fold}"
+    metrics_path = out.with_suffix(".metrics.json")
+
+    if out.exists() and metrics_path.exists() and not args.force:
+        msg = (f"[{name} fold={fold}] already trained -> {out}, skipping "
+               f"({args.results.name} updated from cached metrics; --force to retrain)")
+        if args.dry_run:
+            print(msg, flush=True)
+            return
+        record_result(result_row(row, fold, "ok", metrics_path), csv_lock, csv_path)
+        print(msg, flush=True)
+        return
 
     # Resolve to absolute paths: the subprocess below runs with cwd=TRAIN_PY.parent,
     # which would otherwise break any relative paths passed on argv.
@@ -178,7 +251,7 @@ def run_job(row: dict, fold: int, gpu_id: int, args, csv_lock, csv_path) -> None
            "--fasta", str(dataset), "--structures", str(args.structures.resolve()),
            "--fold", str(fold), "--out", str(out),
            "--max-seconds", str(args.max_seconds), "--seed", str(args.seed)]
-    cfg_path = config_for_model(model)
+    cfg_path = config_for_row(row)
     if cfg_path is not None:
         cmd += ["--config", str(cfg_path)]
     if args.wandb:
@@ -195,31 +268,12 @@ def run_job(row: dict, fold: int, gpu_id: int, args, csv_lock, csv_path) -> None
         proc = subprocess.run(cmd, cwd=str(TRAIN_PY.parent), env=full_env,
                               stdout=logf, stderr=subprocess.STDOUT)
 
-    out_row = {"name": name, "dataset": dataset_name, "model": model, "fold": fold,
-               "val_auc": "", "steps": "", "seconds": "",
-               "status": "ok" if proc.returncode == 0 else f"FAILED (rc={proc.returncode})"}
-    for b in BENCHMARKS:
-        out_row[f"test_auc_{b}"] = ""
-
-    metrics_path = out.with_suffix(".metrics.json")
-    if metrics_path.exists():
-        m = json.loads(metrics_path.read_text())
-        out_row["val_auc"] = m["val_auc"]
-        out_row["steps"] = m["steps"]
-        out_row["seconds"] = m["seconds"]
-        for b in BENCHMARKS:
-            out_row[f"test_auc_{b}"] = m["test_auc"].get(b, "")
-
-    with csv_lock:
-        write_header = not csv_path.exists()
-        with open(csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            if write_header:
-                w.writeheader()
-            w.writerow(out_row)
+    status = "ok" if proc.returncode == 0 else f"FAILED (rc={proc.returncode})"
+    out_row = result_row(row, fold, status, metrics_path)
+    record_result(out_row, csv_lock, csv_path)
 
     test_auc_str = ", ".join(f"{b}={out_row[f'test_auc_{b}']}" for b in BENCHMARKS)
-    print(f"[{name} fold={fold} gpu={gpu_id}] done: {out_row['status']} "
+    print(f"[{name} fold={fold} gpu={gpu_id}] done: {status} "
           f"val_auc={out_row['val_auc']} test_auc={{{test_auc_str}}}", flush=True)
 
 
@@ -245,7 +299,7 @@ def submit_slurm_job(row: dict, fold: int, args) -> None:
         "SEED": str(args.seed),
         "WANDB": "1" if args.wandb else "0",
     }
-    cfg_path = config_for_model(model)
+    cfg_path = config_for_row(row)
     if cfg_path is not None:
         env["CONFIG_FILE"] = str(cfg_path)
     if args.wandb:
@@ -309,11 +363,16 @@ def main() -> None:
     p.add_argument("--log-dir", type=Path, default=Path(__file__).resolve().parent / "logs")
     p.add_argument("--results", type=Path, default=Path(__file__).resolve().parent / "results.csv")
     p.add_argument("--list", type=Path, default=Path(__file__).resolve().parent / "ablation_list.csv",
-                   help="CSV of name,dataset,model rows defining the sweep "
-                        "(generated with a default sweep the first time, if missing)")
+                   help="CSV of name,dataset,model,config rows defining the sweep "
+                        "(config optional; generated with a default sweep the first "
+                        "time, if missing)")
     p.add_argument("--max-seconds", type=int, default=14400)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--folds", type=int, nargs="+", default=list(FOLDS))
+    p.add_argument("--force", action="store_true",
+                   help="retrain jobs whose weights + metrics already exist under "
+                        "--weights-dir (by default those are skipped, with their "
+                        "cached metrics recorded in --results)")
     p.add_argument("--n-workers", type=int, default=None,
                    help="parallel jobs (default: number of visible GPUs)")
     p.add_argument("--summarize-only", action="store_true",
@@ -346,6 +405,11 @@ def main() -> None:
     missing = [r["dataset"] for r in rows if not (args.tte_dir / r["dataset"]).exists()]
     if missing:
         p.error(f"dataset(s) referenced in {args.list} not found under {args.tte_dir}: {sorted(set(missing))}")
+
+    bad_cfgs = sorted({str(c) for r in rows if (c := row_config_path(r)) is not None and not c.exists()})
+    if bad_cfgs:
+        p.error(f"config(s) referenced in {args.list} not found (relative names resolve "
+                f"under {CONFIGS_DIR}): {bad_cfgs}")
 
     jobs = [(row, f) for row in rows for f in args.folds]
 
