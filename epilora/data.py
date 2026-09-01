@@ -81,6 +81,11 @@ def parse_seq_id(header: str):
     return pdb_id, chains
 
 
+def default_cache_dir(structures_dir: Path) -> Path:
+    """Cache dir for coords/RSA, a writable sibling of the (read-only) structures dir."""
+    return Path(structures_dir).parent / f"{Path(structures_dir).name}_coords_cache"
+
+
 def _coords_cache_path(cache_dir: Path, cif_path: Path, chain_ids: list[str], seq_len: int) -> Path:
     """Cache path for load_backbone_coords' (deterministic) output -- a flat
     file per (structure, chains, length) under ``cache_dir``."""
@@ -221,6 +226,12 @@ def aa_one_hot(seq: str) -> np.ndarray:
 # relativeTotal is ~[0, 1] but can exceed 1 for unusually exposed residues;
 # clipped only to bound outliers.
 RSA_CLIP_MAX = 2.0
+
+# A residue counts as "surface" at/above this relative accessibility -- the
+# repo's standing convention (data/scripts/pct_non_epitope_surface_hist.py).
+# make_surface_fasta.py binarises RSA with it, and train.py's
+# loss_mask="surface" trains on the residues it marks.
+RSA_SURFACE_CUTOFF = 0.20
 
 # Fill for residues freesasa reports no relative area for -- treated as
 # buried rather than dropping the antigen.
@@ -390,6 +401,33 @@ def rsa_for_structure_file(path: Path, chain_ids: list[str], seq_len: int) -> np
     return residue_rsa(residues, path)
 
 
+def load_surface_masks(path: Path, entries: list) -> dict:
+    """Per-residue surface masks for ``entries`` from a make_surface_fasta.py FASTA.
+
+    Returns {header: (len(seq),) float32 1/0 array}, 1 = surface. The file's
+    headers must match ``entries`` 1:1 in content (same records, same order
+    not required); entries with no record in the file are simply absent from
+    the dict -- the caller decides what to do (train.py skips and counts
+    them), since make_surface_fasta.py drops exactly the entries whose RSA
+    couldn't be had, i.e. the ones training skips for missing coords anyway.
+    Raises on a length mismatch, which would mean the surface FASTA and the
+    training FASTA disagree about a sequence and must not be silently worked
+    around.
+    """
+    available = {header: np.asarray(labels, dtype=np.float32)
+                 for v in parse_fasta(path).values() for (header, _, labels) in v}
+    masks = {}
+    for header, seq, _ in entries:
+        mask = available.get(header)
+        if mask is None:
+            continue
+        if len(mask) != len(seq):
+            raise ValueError(f"{path}: surface annotation for {header!r} has {len(mask)} "
+                             f"residues but the training FASTA's sequence has {len(seq)}")
+        masks[header] = mask
+    return masks
+
+
 def load_samples(entries: list, structures_dir: Path, cache_dir: Path | None = None,
                  extra_feats=()) -> list:
     """Attach backbone coords (and optionally extra head features) to
@@ -399,7 +437,7 @@ def load_samples(entries: list, structures_dir: Path, cache_dir: Path | None = N
     sibling of ``structures_dir``, which itself is read-only."""
     structures_dir = Path(structures_dir)
     if cache_dir is None:
-        cache_dir = structures_dir.parent / f"{structures_dir.name}_coords_cache"
+        cache_dir = default_cache_dir(structures_dir)
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     extra_feats = tuple(extra_feats)

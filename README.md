@@ -114,3 +114,29 @@ Each checkpoint records which features its head expects, so `predict.py`,
 `predict_ensemble.py` and `eval_final.py` recompute them from the structure
 automatically — checkpoints trained without them keep working untouched. RSA is
 cached next to the backbone coordinates (`*_coords_cache/*.rsa.npy`).
+
+### Surface-only loss
+
+Training can also restrict the loss — and so the gradients — to **surface
+residues** only (relative solvent accessibility >= 0.20, the repo's standing
+convention). Buried residues are never epitopes, so training on them mostly
+teaches the trivial buried → non-epitope decision instead of the surface
+epitope/non-epitope decision that actually matters:
+
+```bash
+python make_surface_fasta.py \
+    --fasta data/train_test_eval/min_resolution_10_epitopes.fasta
+python train.py --config configs/loss_surface.yaml \
+    --fasta data/train_test_eval/min_resolution_10_epitopes.fasta \
+    --fold 1 --out weights/min_resolution_10_esmif1_surface_fold1.pt
+```
+
+The first command writes `<fasta stem>_surface.fasta` — the same records with
+each residue's case marking surface (lowercase) vs buried (uppercase) — once,
+from the cached RSA, and every epoch of every fold reuses it. Early stopping
+and test AUCs still score **every** residue of the shared benchmark, so
+surface-masked runs stay comparable to unmasked ones.
+
+Like the extra-features config, `configs/loss_surface.yaml` is machine-local
+and not committed — write it yourself; it is a single line, `loss_mask:
+surface`.

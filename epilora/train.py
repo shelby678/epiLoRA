@@ -12,7 +12,8 @@ label ``i.j`` (see ``data/README.md``); ``--fold i`` trains on every record
 whose fold != i.
 
 Every hyperparameter/backbone axis (LoRA rank/alpha/layers, RYS window, head
-dim, dropout, backbone, extra head features) lives in the ``TrainConfig`` dataclass below, not
+dim, dropout, backbone, extra head features, loss masking) lives in the
+``TrainConfig`` dataclass below, not
 on the CLI directly: ``--config`` points at one of the named ablations under
 ``configs/`` (default: none, i.e. the champion recipe, ``TrainConfig()``'s
 own field defaults). ``--max-seconds``/``--eval-fastas``/``--wandb*`` are the
@@ -49,7 +50,7 @@ import torch.nn.functional as F
 import yaml
 from sklearn.metrics import roc_auc_score
 
-from data import load_samples, parse_fasta
+from data import load_samples, load_surface_masks, parse_fasta
 from model import build_model
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -89,6 +90,15 @@ class TrainConfig:
     # Extra per-residue head inputs (e.g. ["rsa", "length"]); see
     # data.EXTRA_FEATURE_NAMES. Empty = the champion head.
     extra_feats: list[str] = dataclasses.field(default_factory=list)
+    # Restrict the training loss (and so the gradients) to a residue subset;
+    # None = every residue, the champion recipe. "surface" = only residues
+    # the companion surface FASTA marks as surface (make_surface_fasta.py,
+    # RSA >= data.RSA_SURFACE_CUTOFF) -- buried residues are never epitopes,
+    # so learning to bury them distracts from the surface epitope/non-epitope
+    # decision that actually matters. Early stopping / test AUCs still score
+    # every residue of the shared benchmark, so runs stay comparable to the
+    # unmasked recipe.
+    loss_mask: Optional[str] = None
     max_seconds: int = 14400
     eval_fastas: list[Path] = dataclasses.field(default_factory=lambda: [
         REPO_ROOT / "data/train_test_eval/allowed_species_homo_sapiens_epitopes.fasta",
@@ -162,14 +172,21 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42, wandb_run=None) -> dict:
-    """Train in-place with early stopping on val ROC-AUC; keep the best weights."""
+def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42,
+          wandb_run=None, surface_masks: Optional[dict] = None) -> dict:
+    """Train in-place with early stopping on val ROC-AUC; keep the best weights.
+
+    ``surface_masks`` (see data.load_surface_masks) restricts the loss to the
+    surface residues of each sample when given -- only those residues send
+    gradients. Samples without an annotation, or with no surface residues at
+    all, are skipped and counted (n_no_mask / n_no_surface)."""
     trainable = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"Trainable params: {sum(p.numel() for p in trainable):,}")
     opt = torch.optim.AdamW(trainable, lr=LR, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / max(1, WARMUP_STEPS)))
 
     best_auc, best_state, no_improve, step, tl, n_skipped = -1.0, None, 0, 0, 0.0, 0
+    n_no_mask = n_no_surface = 0
     rng = np.random.default_rng(seed)
     idxs = list(range(len(train_samples)))
     start = time.time()
@@ -183,14 +200,30 @@ def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42, w
             header, seq, labels, coords, feats = train_samples[idx]
             if not usable(model, train_samples[idx]):
                 continue
+            mask = None if surface_masks is None else surface_masks.get(header)
+            if surface_masks is not None and mask is None:
+                n_no_mask += 1
+                continue
+            if mask is not None and not mask.any():
+                n_no_surface += 1
+                continue
             try:
                 logits = model([coords], [seq], [feats])[0]
             except Exception as e:
                 n_skipped += 1
                 logger.warning(f"train: skip {header}: {e}")
                 continue
-            loss = F.binary_cross_entropy_with_logits(
-                logits, torch.tensor(labels, dtype=torch.float32, device=model.device))
+            labels_t = torch.tensor(labels, dtype=torch.float32, device=model.device)
+            if mask is None:
+                loss = F.binary_cross_entropy_with_logits(logits, labels_t)
+            else:
+                # Mean over surface residues only: (per-residue BCE * mask).sum()
+                # / mask.sum(). Buried residues contribute neither loss nor
+                # gradient, but the head still scores them at eval time.
+                m = torch.as_tensor(mask, dtype=torch.float32, device=model.device)
+                loss = (F.binary_cross_entropy_with_logits(logits, labels_t,
+                                                            reduction="none") * m
+                        ).sum() / m.sum()
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -202,9 +235,11 @@ def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42, w
                 va = evaluate_auc(model, val_samples)
                 model.train()
                 logger.info(f"step={step} train_loss={tl:.4f} val_auc={va:.4f} "
-                            f"skipped={n_skipped} {time.time()-start:.0f}s")
+                            f"skipped={n_skipped} no_mask={n_no_mask} "
+                            f"no_surface={n_no_surface} {time.time()-start:.0f}s")
                 if wandb_run is not None:
-                    wandb_run.log({"train_loss": tl, "val_auc": va, "skipped": n_skipped}, step=step)
+                    wandb_run.log({"train_loss": tl, "val_auc": va, "skipped": n_skipped,
+                                   "no_mask": n_no_mask, "no_surface": n_no_surface}, step=step)
                 if va > best_auc:
                     best_auc, no_improve = va, 0
                     best_state = model.trainable_state_dict()
@@ -221,7 +256,8 @@ def train(model, train_samples, val_samples, max_seconds: int, seed: int = 42, w
                         "(max-seconds too short, or every sample failed?); "
                         "reporting current, not best, weights")
     return {"steps": step, "val_auc": evaluate_auc(model, val_samples),
-            "best_auc": best_auc, "skipped": n_skipped}
+            "best_auc": best_auc, "skipped": n_skipped,
+            "no_mask": n_no_mask, "no_surface": n_no_surface}
 
 
 def eval_name(path: Path) -> str:
@@ -301,6 +337,17 @@ def main() -> None:
         p.error(f"extra_feats={cfg.extra_feats} is only wired for backbone=esmif1, "
                 f"not {cfg.backbone!r}")
 
+    surface_masks = None
+    surface_fasta = None
+    if cfg.loss_mask is not None:
+        if cfg.loss_mask != "surface":
+            p.error(f"unknown loss_mask {cfg.loss_mask!r} (only 'surface' or null)")
+        surface_fasta = args.fasta.with_name(f"{args.fasta.stem}_surface.fasta")
+        if not surface_fasta.exists():
+            p.error(f"loss_mask={cfg.loss_mask!r} needs {surface_fasta} -- generate it "
+                    f"with make_surface_fasta.py --fasta {args.fasta}")
+        logger.info(f"Loss masked to surface residues: {surface_fasta}")
+
     logger.info(f"Loading structures ({DEVICE}) ...")
     load_kwargs = dict(extra_feats=cfg.extra_feats)
     train_samples = load_samples(train_entries, args.structures, **load_kwargs)
@@ -311,6 +358,15 @@ def main() -> None:
                 f"val={len(val_samples)} ({n_va} w/ struct)")
     if n_tr == 0:
         p.error("no structure-backed training samples found — check --structures path")
+
+    if surface_fasta is not None:
+        surface_masks = load_surface_masks(surface_fasta, train_entries)
+        n_masked = sum(1 for s in train_samples
+                       if s[3] is not None and s[0] in surface_masks
+                       and surface_masks[s[0]].any())
+        logger.info(f"Surface mask covers {len(surface_masks)}/{len(train_entries)} "
+                    f"train entries ({n_masked} usable: struct + mask + >=1 surface "
+                    f"residue)")
 
     if cfg.backbone == "esmif1":
         model = build_model(device=DEVICE, rank=cfg.lora_rank, alpha=cfg.lora_alpha,
@@ -346,9 +402,11 @@ def main() -> None:
         # backbone silently trained an ESMc model instead of erroring.
         p.error(f"unknown backbone {cfg.backbone!r}")
     t0 = time.time()
-    res = train(model, train_samples, val_samples, cfg.max_seconds, seed=args.seed, wandb_run=wandb_run)
+    res = train(model, train_samples, val_samples, cfg.max_seconds, seed=args.seed,
+                wandb_run=wandb_run, surface_masks=surface_masks)
     logger.info(f"Done: best val_auc={res['best_auc']:.4f} steps={res['steps']} "
-                f"skipped={res['skipped']} {time.time()-t0:.0f}s")
+                f"skipped={res['skipped']} no_mask={res['no_mask']} "
+                f"no_surface={res['no_surface']} {time.time()-t0:.0f}s")
 
     test_aucs = {}
     for ef, by_part_eval in eval_by_fasta.items():
@@ -373,6 +431,7 @@ def main() -> None:
                 "fasta": str(args.fasta),
                 "fold": args.fold,
                 "seed": args.seed,
+                "loss_mask": cfg.loss_mask,
                 "val_auc": res["best_auc"],
                 "test_auc": test_aucs}, args.out)
     logger.info(f"Saved checkpoint -> {args.out}")
@@ -380,7 +439,7 @@ def main() -> None:
     metrics_path = args.out.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps({
         "backbone": cfg.backbone, "fasta": str(args.fasta), "fold": args.fold,
-        "seed": args.seed, "steps": res["steps"],
+        "seed": args.seed, "loss_mask": cfg.loss_mask, "steps": res["steps"],
         "seconds": round(time.time() - t0), "val_auc": res["best_auc"], "test_auc": test_aucs,
     }, indent=2))
 
