@@ -63,7 +63,7 @@ def summarize(label, vanilla, epitope, key):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--vanilla-csv", default="scratch/vanilla_capri_results.csv")
-    p.add_argument("--epitope-csv", default="capri_results.csv")
+    p.add_argument("--epitope-csv", default="results/capri_results.csv")
     p.add_argument("--out-csv", default="scratch/comparison_per_run.csv")
     args = p.parse_args()
 

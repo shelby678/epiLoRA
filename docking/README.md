@@ -19,12 +19,26 @@ For each `(dname, ab, ag)` combination discovered under `input_pdbs/{dname}/`:
 4. **haddock_config** — render `template.cfg` into a per-pair `run.toml`.
 5. **run_haddock** — run HADDOCK3 (rigidbody → flexref → emref → clustering).
 6. **capri_analysis** — recompute lRMSD/iRMSD/fnat/DockQ for every cluster
-   model directly against the crystal structure → `capri_results.csv`,
-   `capri_plot.png`. Independent of HADDOCK3's own caprieval, so it covers
-   every dname.
+   model directly against the crystal structure → `results/capri_results.csv`,
+   `results/capri_plot.png`. Independent of HADDOCK3's own caprieval, so it
+   covers every dname.
 7. **compute_rmsd** — pull HADDOCK3's own caprieval numbers
-   (`11_caprieval/capri_ss.tsv`) → `rmsd_results.csv`, `rmsd_summary.csv`, as
-   a cross-check. Only meaningful for dnames with `runs/{dname}/reference.pdb`.
+   (`11_caprieval/capri_ss.tsv`) → `results/rmsd_results.csv`,
+   `results/rmsd_summary.csv`, as a cross-check. Only meaningful for dnames
+   with `runs/{dname}/reference.pdb`.
+8. **capri_acceptable** — recompute CAPRI quality per cluster model for
+   epiLoRA-constrained vs vanilla runs, for antigens with 5/5 ab runs complete
+   in both conditions → `results/capri_acceptable_counts.csv`,
+   `results/capri_model_details.csv`.
+9. **capri_figures** — acceptable-count bars, HADDOCK-score violins and the
+   combined two-panel figure from those CSVs.
+10. **runtime_boxplot** — per-run HADDOCK3 wall-clock runtime, vanilla vs
+    epiLoRA, over matched runs → `results/runtime_by_run.csv`,
+    `results/runtime_boxplot.png`.
+
+All analysis CSVs and plots land in `results/`. Steps 6–7 (and their
+`*_vanilla` twins) wait for every run to finish; steps 8–10 work on whatever
+runs are complete and refresh as more land.
 
 Run with:
 
@@ -60,13 +74,16 @@ epitope-threshold overlap per antigen, via `env/bin/haddock3-restraints`).
   `generate_restraints.py` (gitignored; rebuilt by `epitope_cache.smk`).
 - `runs/{dname}/{ab}_vs_{ag}/` — per-pair working dir and HADDOCK3 output
   (gitignored).
+- `results/` — all analysis CSVs and plots (gitignored).
 - `env/` — HADDOCK3 install used by `run_haddock` (gitignored).
 
 ## `scripts/`
 
 **Wired into the Snakefile:**
 `prepare_pdbs.py`, `prepare_reference.py`, `generate_restraints.py`,
-`make_haddock_config.sh`, `capri_analysis.py`, `compute_rmsd.py`.
+`make_haddock_config.sh`, `capri_analysis.py`, `compute_rmsd.py`,
+`plot_capri_acceptable.py`, `plot_capri_figures.py`,
+`plot_runtime_boxplot.py`.
 
 **Wired into `epitope_cache.smk`:**
 `stage_antigens.py`, `dump_residue_keys.py`, `build_epitope_cache.py`,

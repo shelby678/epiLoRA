@@ -19,8 +19,8 @@ CAPRI metrics:
   quality – High / Medium / Acceptable / Incorrect
 
 Output:
-  capri_results.csv  – one row per cluster model
-  capri_plot.png     – score vs lRMSD scatter, coloured by CAPRI class
+  results/capri_results.csv  – one row per cluster model
+  results/capri_plot.png – score vs lRMSD scatter, coloured by CAPRI class
 """
 import argparse
 import gzip
@@ -524,8 +524,8 @@ def main():
                    help="Parent dir containing {pdb_id}/ab_1.pdb")
     p.add_argument("--ag-dir",      default="input_pdbs",
                    help="Parent dir containing {pdb_id}/ag.pdb")
-    p.add_argument("--out-csv",  default="capri_results.csv")
-    p.add_argument("--out-plot", default="capri_plot.png")
+    p.add_argument("--out-csv",  default="results/capri_results.csv")
+    p.add_argument("--out-plot", default="results/capri_plot.png")
     args = p.parse_args()
 
     runs_root   = Path(args.runs_dir)

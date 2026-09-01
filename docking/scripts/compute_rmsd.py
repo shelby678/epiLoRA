@@ -77,11 +77,11 @@ def main():
         help="Path to the runs/ directory (default: %(default)s)",
     )
     p.add_argument(
-        "--out", default="rmsd_results.csv",
+        "--out", default="results/rmsd_results.csv",
         help="Per-model results CSV (default: %(default)s)",
     )
     p.add_argument(
-        "--summary-out", default="rmsd_summary.csv",
+        "--summary-out", default="results/rmsd_summary.csv",
         help="Best-model-per-run summary CSV (default: %(default)s)",
     )
     args = p.parse_args()

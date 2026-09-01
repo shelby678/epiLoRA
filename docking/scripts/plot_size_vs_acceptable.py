@@ -16,7 +16,7 @@ def main():
     sz["pdb_id"] = sz["pdb_stem"].str.replace("_ag_gt", "", regex=False).str.replace("_ag", "", regex=False)
     size_by_dname = sz.groupby("pdb_id")["n_residues"].mean().rename("mean_n_residues")
 
-    df = pd.read_csv("capri_results.csv")
+    df = pd.read_csv("results/capri_results.csv")
     acc = df["quality"].isin(["High", "Medium", "Acceptable"])
     df = df.assign(acc=acc)
     g = df.groupby("pdb_id").agg(n_models=("acc", "size"), n_acc=("acc", "sum"))

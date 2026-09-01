@@ -24,7 +24,7 @@ ACCEPTABLE_OR_BETTER = {"High", "Medium", "Acceptable"}
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--in-csv", default="capri_results.csv")
+    p.add_argument("--in-csv", default="results/capri_results.csv")
     p.add_argument("--out-png", default="scratch/score_vs_lrmsd_by_antigen.png")
     p.add_argument("--ncols", type=int, default=5)
     args = p.parse_args()

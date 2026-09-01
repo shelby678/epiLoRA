@@ -14,7 +14,7 @@ GRAY = "#9a9990"
 def main():
     ab = pd.read_csv("scratch/ab_apo_gt_rmsd_by_dname.csv").set_index("pdb_id")
 
-    df = pd.read_csv("capri_results.csv")
+    df = pd.read_csv("results/capri_results.csv")
     acc = df["quality"].isin(["High", "Medium", "Acceptable"])
     df = df.assign(acc=acc)
     g = df.groupby("pdb_id").agg(n_models=("acc", "size"), n_acc=("acc", "sum"))

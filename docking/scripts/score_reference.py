@@ -12,7 +12,7 @@ For each PDB ID with completed docking runs, this script:
 
 Usage:
   python scripts/score_reference.py \\
-    [--capri-csv capri_results.csv] \\
+    [--capri-csv results/capri_results.csv] \\
     [--crystal-dir input_pdbs/selected_32_pdbs] \\
     [--ab-dir input_pdbs] \\
     [--work-dir /tmp/crystal_scoring] \\
@@ -402,7 +402,7 @@ def make_stratified_plot(rows, crystal_scores, out_path):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--capri-csv",    default="capri_results.csv")
+    p.add_argument("--capri-csv",    default="results/capri_results.csv")
     p.add_argument("--crystal-dir",  default="input_pdbs/selected_32_pdbs")
     p.add_argument("--ab-dir",       default="input_pdbs")
     p.add_argument("--work-dir",     default="/tmp/crystal_scoring")

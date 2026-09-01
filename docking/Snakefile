@@ -84,15 +84,32 @@ ALL_DONE_VANILLA = expand(
     ag=AGSTEMS,
 )
 
+# ─── Analysis inputs for the capri_acceptable rule: the done markers that
+# exist *right now*, re-globbed on every invocation, so the comparison plots
+# refresh as new runs land without blocking on the ones still missing
+# (unlike the capri_analysis/compute_rmsd rules, which wait for ALL_DONE).
+# The HADDOCK logs are deliberately NOT tracked here: they double as `log:`
+# outputs of run_haddock, so using them as inputs would drag docking jobs
+# (including failed runs) into the plot rules' DAGs. ────────────────────────
+DONE_EPI     = sorted(glob.glob("runs/*/ab_[1-5]_vs_ag/done"))
+DONE_VANILLA = sorted(glob.glob("runs_vanilla/*/ab_[1-5]_vs_ag/done"))
+
 
 rule all:
     input:
         ALL_DONE,
         ALL_DONE_VANILLA,
-        "capri_results.csv",
-        "rmsd_results.csv",
-        "capri_results_vanilla.csv",
-        "rmsd_results_vanilla.csv",
+        "results/capri_results.csv",
+        "results/rmsd_results.csv",
+        "results/capri_results_vanilla.csv",
+        "results/rmsd_results_vanilla.csv",
+        "results/capri_acceptable_counts.csv",
+        "results/capri_model_details.csv",
+        "results/capri_acceptable_plot.png",
+        "results/haddock_score_violin.png",
+        "results/capri_combined_plot.pdf",
+        "results/runtime_by_run.csv",
+        "results/runtime_boxplot.png",
 
 
 rule prepare_pdbs:
@@ -295,8 +312,8 @@ rule capri_analysis:
     input:
         done = ALL_DONE,
     output:
-        csv  = "capri_results.csv",
-        plot = "capri_plot.png",
+        csv  = "results/capri_results.csv",
+        plot = "results/capri_plot.png",
     log:
         "logs/capri_analysis.log"
     shell:
@@ -316,8 +333,8 @@ rule compute_rmsd:
     input:
         done = ALL_DONE,
     output:
-        csv     = "rmsd_results.csv",
-        summary = "rmsd_summary.csv",
+        csv     = "results/rmsd_results.csv",
+        summary = "results/rmsd_summary.csv",
     log:
         "logs/compute_rmsd.log"
     shell:
@@ -332,8 +349,8 @@ rule capri_analysis_vanilla:
     input:
         done = ALL_DONE_VANILLA,
     output:
-        csv  = "capri_results_vanilla.csv",
-        plot = "capri_plot_vanilla.png",
+        csv  = "results/capri_results_vanilla.csv",
+        plot = "results/capri_plot_vanilla.png",
     log:
         "logs/capri_analysis_vanilla.log"
     shell:
@@ -349,12 +366,75 @@ rule compute_rmsd_vanilla:
     input:
         done = ALL_DONE_VANILLA,
     output:
-        csv     = "rmsd_results_vanilla.csv",
-        summary = "rmsd_summary_vanilla.csv",
+        csv     = "results/rmsd_results_vanilla.csv",
+        summary = "results/rmsd_summary_vanilla.csv",
     log:
         "logs/compute_rmsd_vanilla.log"
     shell:
         "/opt/conda/bin/python scripts/compute_rmsd.py"
         " --runs-dir runs_vanilla"
         " --out {output.csv} --summary-out {output.summary}"
+        " > {log} 2>&1"
+
+
+rule capri_acceptable:
+    """Recompute CAPRI quality (via capri_analysis) for every cluster model
+    of every completed run, for both conditions, and write the per-antigen
+    counts and per-model details CSVs the figure rules consume. Only
+    antigens with all 5 ab runs complete in both runs/ and runs_vanilla/
+    are included, so this doesn't need to wait for ALL_DONE."""
+    input:
+        done = DONE_EPI + DONE_VANILLA,
+    output:
+        counts  = "results/capri_acceptable_counts.csv",
+        details = "results/capri_model_details.csv",
+    log:
+        "logs/plot_capri_acceptable.log"
+    shell:
+        "/opt/conda/bin/python scripts/plot_capri_acceptable.py"
+        " --runs-dir runs --vanilla-dir runs_vanilla"
+        " --crystal-dir {REF_PDB_DIR} --ab-dir {EXPORT_DIR}"
+        " --out-counts {output.counts} --out-details {output.details}"
+        " > {log} 2>&1"
+
+
+rule capri_figures:
+    """Comparison figures (acceptable-count bars, HADDOCK-score violins,
+    and the combined two-panel figure) from the capri_acceptable CSVs."""
+    input:
+        counts  = "results/capri_acceptable_counts.csv",
+        details = "results/capri_model_details.csv",
+    output:
+        bar      = "results/capri_acceptable_plot.png",
+        violin   = "results/haddock_score_violin.png",
+        combined = "results/capri_combined_plot.pdf",
+    log:
+        "logs/plot_capri_figures.log"
+    shell:
+        "/opt/conda/bin/python scripts/plot_capri_figures.py"
+        " --counts {input.counts} --details {input.details}"
+        " --outdir results > {log} 2>&1"
+
+
+rule runtime_boxplot:
+    """Box plot of per-run HADDOCK3 wall-clock runtime (vanilla vs epiLoRA),
+    over matched runs of the same antigen set as capri_acceptable."""
+    input:
+        counts = "results/capri_acceptable_counts.csv",
+    params:
+        # log dirs are passed as params, not inputs: they double as `log:`
+        # outputs of run_haddock, so tracking them here would drag docking
+        # jobs (including failed runs) into this rule's DAG.
+        logs_dir = "logs",
+        logs_vanilla_dir = "logs_vanilla",
+    output:
+        csv  = "results/runtime_by_run.csv",
+        plot = "results/runtime_boxplot.png",
+    log:
+        "logs/plot_runtime_boxplot.log"
+    shell:
+        "/opt/conda/bin/python scripts/plot_runtime_boxplot.py"
+        " --counts {input.counts}"
+        " --logs-dir {params.logs_dir} --logs-vanilla-dir {params.logs_vanilla_dir}"
+        " --out-csv {output.csv} --out-plot {output.plot}"
         " > {log} 2>&1"
