@@ -115,28 +115,33 @@ Each checkpoint records which features its head expects, so `predict.py`,
 automatically — checkpoints trained without them keep working untouched. RSA is
 cached next to the backbone coordinates (`*_coords_cache/*.rsa.npy`).
 
-### Surface-only loss
+### Surface-weighted loss
 
-Training can also restrict the loss — and so the gradients — to **surface
-residues** only (relative solvent accessibility >= 0.20, the repo's standing
-convention). Buried residues are never epitopes, so training on them mostly
-teaches the trivial buried → non-epitope decision instead of the surface
-epitope/non-epitope decision that actually matters:
+Training can also weight the loss — and so the gradients — by **surface
+exposure**: surface residues (relative solvent accessibility >= 0.20, the repo's
+standing convention) at weight 1.0 and buried residues at `buried_weight`:
 
 ```bash
 python make_surface_fasta.py \
     --fasta data/train_test_eval/min_resolution_10_epitopes.fasta
-python train.py --config configs/loss_surface.yaml \
+python train.py --config configs/loss_surface_buried30.yaml \
     --fasta data/train_test_eval/min_resolution_10_epitopes.fasta \
     --fold 1 --out weights/min_resolution_10_esmif1_surface_fold1.pt
 ```
 
 The first command writes `<fasta stem>_surface.fasta` — the same records with
 each residue's case marking surface (lowercase) vs buried (uppercase) — once,
-from the cached RSA, and every epoch of every fold reuses it. Early stopping
-and test AUCs still score **every** residue of the shared benchmark, so
-surface-masked runs stay comparable to unmasked ones.
+from the cached RSA, and every epoch of every fold reuses it. `buried_weight`
+is the relative loss weight of buried residues: `0.3` lets each one update the
+model 30% as much as a surface residue (buried residues are never epitopes, so
+down-weighting them focuses training on the surface epitope/non-epitope
+decision without discarding their "not an epitope" signal entirely);
+`0.0` (`configs/loss_surface.yaml`) masks them out completely, and `1.0`
+recovers the unweighted champion. `configs/loss_surface_buried{10,30,50,70,90}.yaml`
+sweep the weight over 0.1–0.9. Early stopping and test AUCs still score
+**every** residue of the shared benchmark, so weighted runs stay comparable to
+unweighted ones.
 
-Like the extra-features config, `configs/loss_surface.yaml` is machine-local
-and not committed — write it yourself; it is a single line, `loss_mask:
-surface`.
+Like the extra-features config, the `loss_surface*` configs are
+machine-local and not committed — write them yourself; each is two lines,
+`loss_mask: surface` and `buried_weight: <w>`.
