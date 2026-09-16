@@ -50,7 +50,9 @@ import torch.nn.functional as F
 import yaml
 from sklearn.metrics import roc_auc_score
 
-from data import load_samples, load_surface_masks, parse_fasta
+from data import (apply_soft_labels, is_soft_labelled, load_samples,
+                  load_soft_labels, load_surface_masks, parse_fasta,
+                  soft_labels_path)
 from model import build_model
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -317,6 +319,31 @@ def main() -> None:
     set_seed(args.seed)
     logger.info(f"Seed: {args.seed}")
 
+    val_label, test_label = f"{args.fold}.0", f"{args.fold}.1"
+
+    by_part = parse_fasta(args.fasta)
+    train_entries = [e for k, v in by_part.items() if int(k.split(".")[0]) != args.fold for e in v]
+
+    # Soft labels (continuous targets, e.g. the opendde epitope-dist datasets):
+    # records marked labels=soft carry their per-residue targets in a companion
+    # <fasta stem>_soft_labels.tsv rather than the sequence casing, so the BCE
+    # loss trains toward the contact fraction instead of a binary call. Only
+    # the training FASTA gets this treatment -- the benchmark eval FASTAs stay
+    # binary, keeping every ablation's early stopping / test AUCs comparable.
+    # Loaded before wandb.init so a bad dataset errors out before a run exists.
+    soft_path = soft_labels_path(args.fasta)
+    soft_labels = load_soft_labels(soft_path) if soft_path.exists() else None
+    if soft_labels is not None:
+        train_entries = apply_soft_labels(train_entries, soft_labels, soft_path)
+        n_soft = sum(1 for h, _, _ in train_entries if is_soft_labelled(h))
+        logger.info(f"Soft labels: {n_soft}/{len(train_entries)} train records train "
+                    f"toward continuous targets from {soft_path.name}")
+    elif any(is_soft_labelled(h) for h, _, _ in train_entries):
+        n_marked = sum(1 for h, _, _ in train_entries if is_soft_labelled(h))
+        p.error(f"{n_marked} train records are marked labels=soft but {soft_path} does "
+                f"not exist -- regenerate the dataset with "
+                f"data/scripts/make_opendde_dataset.py")
+
     wandb_run = None
     if cfg.wandb:
         import wandb
@@ -329,12 +356,9 @@ def main() -> None:
             return v
         wandb_config = {k: jsonable(v) for k, v in
                         {**vars(args), **dataclasses.asdict(cfg)}.items()}
+        if soft_labels is not None:
+            wandb_config["soft_labels"] = str(soft_path)
         wandb_run = wandb.init(project=cfg.wandb_project, name=run_name, config=wandb_config)
-
-    val_label, test_label = f"{args.fold}.0", f"{args.fold}.1"
-
-    by_part = parse_fasta(args.fasta)
-    train_entries = [e for k, v in by_part.items() if int(k.split(".")[0]) != args.fold for e in v]
 
     eval_by_fasta = {ef: parse_fasta(ef) for ef in cfg.eval_fastas}
     val_entries = eval_by_fasta[cfg.eval_fastas[0]].get(val_label, []) # use the first fasta for evalution
@@ -449,6 +473,7 @@ def main() -> None:
                 "seed": args.seed,
                 "loss_mask": cfg.loss_mask,
                 "buried_weight": cfg.buried_weight,
+                "soft_labels": str(soft_path) if soft_labels is not None else None,
                 "val_auc": res["best_auc"],
                 "test_auc": test_aucs}, args.out)
     logger.info(f"Saved checkpoint -> {args.out}")
@@ -457,7 +482,9 @@ def main() -> None:
     metrics_path.write_text(json.dumps({
         "backbone": cfg.backbone, "fasta": str(args.fasta), "fold": args.fold,
         "seed": args.seed, "loss_mask": cfg.loss_mask,
-        "buried_weight": cfg.buried_weight, "steps": res["steps"],
+        "buried_weight": cfg.buried_weight,
+        "soft_labels": str(soft_path) if soft_labels is not None else None,
+        "steps": res["steps"],
         "seconds": round(time.time() - t0), "val_auc": res["best_auc"], "test_auc": test_aucs,
     }, indent=2))
 

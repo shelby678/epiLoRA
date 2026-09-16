@@ -145,3 +145,34 @@ unweighted ones.
 Like the extra-features config, the `loss_surface*` configs are
 machine-local and not committed — write them yourself; each is two lines,
 `loss_mask: surface` and `buried_weight: <w>`.
+
+### Opendde soft-label ablation
+
+The opendde epitope-dist datasets label each residue with the *fraction of
+docked antibodies contacting it* — a continuous target, unlike the binary
+SAbDab epitope calls. Build them from an opendde `epitope_dist` export with
+`data/scripts/make_opendde_dataset.py` (see `data/README.md`), which writes
+per label flavour (`best` = each antibody through its best-ranked sample,
+`all` = every sample pooled):
+
+- `opendde_<flavour>_epitopes.fasta` + `opendde_<flavour>_epitopes_soft_labels.tsv` —
+  opendde-only training sets, and
+- `allowed_species_homo_sapiens_min_resolution_10_plus_opendde_<flavour>_epitopes.fasta` (+ its
+  own companion) — the champion dataset with the opendde records appended.
+
+Records whose header carries a `labels=soft` field take their targets from
+the companion `<fasta stem>_soft_labels.tsv` (keyed by the full header)
+instead of the sequence casing, so `train.py` trains them with soft-target
+BCE — nothing else about the recipe changes, and early stopping / test AUCs
+still score the binary benchmark, keeping the rows comparable to every other
+ablation. The companion is picked up automatically from the FASTA's name; a
+soft-marked record without a companion row is an error, never a silent
+all-zero label. Source CIFs (full predicted antibody-antigen complexes) are
+staged as `pdb_<uniprot>/pdb_<uniprot>.cif` under `--structures` — the
+loader falls back from the `<pdb_id>_sabdab.cif` name to that plain `.cif`
+(see `data.structure_path`) and only reads the antigen chain named in the
+header. Antigens >=40% identical to a benchmark/eval antigen are dropped at
+prep time, so no opendde training antigen near-duplicates a held-out
+epitope. Run the four rows x five folds with
+`ablation/ablation_list_opendde*.csv`; results land in
+`ablation/results_opendde*.csv`.

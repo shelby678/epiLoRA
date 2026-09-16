@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from data import (RSA_SURFACE_CUTOFF, default_cache_dir, load_rsa, parse_fasta,
-                  parse_seq_id)
+                  parse_seq_id, structure_path)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -69,9 +69,7 @@ def main() -> None:
     with open(out, "w") as f:
         for header, seq, labels in entries:
             pdb_id, chains = parse_seq_id(header)
-            cp = args.structures / pdb_id / f"{pdb_id}_sabdab.cif"
-            if not cp.exists():
-                raise FileNotFoundError(f"no structure file for {header!r}: {cp}")
+            cp = structure_path(args.structures, pdb_id)  # raises FileNotFoundError if absent
             rsa = load_rsa(cp, chains, len(seq), cache_dir)
             if rsa is None:
                 missing.append(header)

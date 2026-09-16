@@ -67,3 +67,29 @@ are non-epitope (UPPERCASE). Surface accessibility comes from freesasa
 only, antibody excluded) with a residue called "surface" at relative SASA
 >= 0.20, the same cutoff used by `benchmarking/discotope3` and
 `benchmarking/webtools/ispred4`.
+
+## Opendde epitope-dist datasets (soft labels)
+
+`scripts/make_opendde_dataset.py` builds the opendde data ablation from an
+opendde `epitope_dist` export (default
+`../../opendde_coreweave/data/epitope_dist`): 250 docked campaign antibodies
+against human-secreted-protein antigens, each residue labelled with the
+*fraction of antibodies contacting it* -- continuous, so it cannot ride in
+the FASTA casing. Per flavour (`best`, `all`) it writes
+`train_test_eval/opendde_<flavour>_epitopes.fasta` with a
+`<fasta stem>_soft_labels.tsv` companion (targets keyed by full header), and
+the same records appended to the champion dataset as
+`allowed_species_homo_sapiens_min_resolution_10_plus_opendde_<flavour>_epitopes.fasta`
+(champion records verbatim -- binary labels, original folds).
+
+Antigens >=40% identical to any benchmark/eval-set antigen are dropped
+(mmseqs2, the standing leakage threshold of `split_eval_clusters.py`);
+the rest are 40%-identity fold-grouped (connected components, the
+`cluster_fasta.py` fold-group tier) and LPT-balanced into the 5 CV groups.
+Each source CIF is a full predicted antibody-antigen complex, copied verbatim
+to `raw/all-structures-extracted/pdb_<uniprot>/pdb_<uniprot>.cif` -- the
+pipeline reads only the antigen chain (always A so far) named in the header.
+
+Standalone (not part of `data_prep.smk`), since the source is an external
+export rather than SAbDab; re-run it after a new epitope_dist export or a
+champion-dataset regeneration.

@@ -86,6 +86,22 @@ def default_cache_dir(structures_dir: Path) -> Path:
     return Path(structures_dir).parent / f"{Path(structures_dir).name}_coords_cache"
 
 
+def structure_path(structures_dir, pdb_id: str) -> Path:
+    """The structure file for ``pdb_id`` under ``structures_dir``: the SAbDab
+    extraction layout ``<pdb_id>/<pdb_id>_sabdab.cif``, falling back to a plain
+    ``<pdb_id>/<pdb_id>.cif`` -- how non-SAbDab structures are staged (e.g. the
+    opendde epitope-dist CIFs, copied verbatim by
+    data/scripts/make_opendde_dataset.py). Raises FileNotFoundError naming both
+    candidates when neither exists."""
+    for name in (f"{pdb_id}_sabdab.cif", f"{pdb_id}.cif"):
+        path = Path(structures_dir) / pdb_id / name
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"no structure file for {pdb_id!r} under {structures_dir} "
+        f"(tried {pdb_id}/{pdb_id}_sabdab.cif and {pdb_id}/{pdb_id}.cif)")
+
+
 def _coords_cache_path(cache_dir: Path, cif_path: Path, chain_ids: list[str], seq_len: int) -> Path:
     """Cache path for load_backbone_coords' (deterministic) output -- a flat
     file per (structure, chains, length) under ``cache_dir``."""
@@ -428,6 +444,82 @@ def load_surface_masks(path: Path, entries: list) -> dict:
     return masks
 
 
+# ==== continuous ("soft") per-residue labels ==================================
+#
+# The opendde epitope-dist datasets (data/scripts/make_opendde_dataset.py)
+# label each residue with the fraction of docked antibodies contacting it --
+# a continuous value the FASTA casing cannot encode. Their records carry a
+# ``labels=soft`` header field, and their targets live in a companion
+# ``<fasta stem>_soft_labels.tsv`` (one ``<header>\t<p,p,p,...>`` row per
+# record, the source's exact probability strings) that train.py substitutes
+# for the casing-derived labels, so the BCE loss simply trains each residue's
+# probability toward its contact fraction (BCE accepts any target in [0, 1]).
+# A dataset mixing soft- and binary-labelled records (the champion-plus-
+# opendde sets) works the same way: only marked records are substituted.
+
+SOFT_LABEL_MARKER = "labels=soft"
+
+
+def soft_labels_path(fasta) -> Path:
+    """The companion soft-labels TSV of a labelled FASTA (see
+    make_opendde_dataset.py); its existence is what marks the dataset as
+    carrying soft labels."""
+    fasta = Path(fasta)
+    return fasta.with_name(f"{fasta.stem}_soft_labels.tsv")
+
+
+def is_soft_labelled(header: str) -> bool:
+    """Does this FASTA record's header carry the labels=soft marker?"""
+    return SOFT_LABEL_MARKER in header.split()
+
+
+def load_soft_labels(path: Path) -> dict[str, np.ndarray]:
+    """{header: (n,) float32 per-residue targets} from a <fasta>_soft_labels.tsv."""
+    out = {}
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) != 2:
+            raise ValueError(f"{path}: expected 'header\\tprobs', got {line[:80]!r}")
+        header, probs = fields
+        if header in out:
+            raise ValueError(f"{path}: duplicate row for {header!r}")
+        out[header] = np.asarray([float(p) for p in probs.split(",")], dtype=np.float32)
+    return out
+
+
+def apply_soft_labels(entries: list, soft_labels: dict, path: Path) -> list:
+    """``entries`` ((header, seq, labels) triples) with every labels=soft
+    record's labels replaced by its soft targets from ``soft_labels`` (loaded
+    from ``path``, for messages); unmarked records keep their casing labels.
+
+    Every marked record must have a row, every row must belong to a marked
+    record, and a row's length must match its sequence -- each of those would
+    mean the FASTA and its companion disagree, and must not be silently
+    worked around (a missing row would silently train that record toward all
+    zeros, since a soft-labelled sequence carries no lowercase).
+    """
+    out = []
+    for header, seq, labels in entries:
+        probs = soft_labels.get(header)
+        if is_soft_labelled(header):
+            if probs is None:
+                raise ValueError(f"{path}: no row for soft-labelled {header!r} -- "
+                                 f"regenerate the dataset with "
+                                 f"data/scripts/make_opendde_dataset.py")
+            if len(probs) != len(seq):
+                raise ValueError(f"{path}: row for {header!r} has {len(probs)} values "
+                                 f"but the sequence has {len(seq)} residues")
+            out.append((header, seq, probs))
+        else:
+            if probs is not None:
+                raise ValueError(f"{path}: row for unmarked {header!r} -- soft-label rows "
+                                 f"must carry the {SOFT_LABEL_MARKER} header field")
+            out.append((header, seq, labels))
+    return out
+
+
 def load_samples(entries: list, structures_dir: Path, cache_dir: Path | None = None,
                  extra_feats=()) -> list:
     """Attach backbone coords (and optionally extra head features) to
@@ -445,9 +537,7 @@ def load_samples(entries: list, structures_dir: Path, cache_dir: Path | None = N
     out = []
     for header, seq, labels in entries:
         pdb_id, chains = parse_seq_id(header)
-        cp = structures_dir / pdb_id / f"{pdb_id}_sabdab.cif"
-        if not cp.exists():
-            raise FileNotFoundError(f"no structure file for {header!r}: {cp}")
+        cp = structure_path(structures_dir, pdb_id)  # raises FileNotFoundError if absent
         coords = load_backbone_coords(cp, chains, len(seq), cache_dir)
         feats = None
         if extra_feats:
