@@ -7,51 +7,31 @@ an AlphaFold3-style co-folding network: an InputFeatureEmbedder + MSA module +
 module and a ConfidenceHead. This file uses the trunk, loaded from the
 antibody-antigen-tuned checkpoint (``opendde_abag.pt``), as a frozen
 per-residue feature extractor: one protein token per residue, so the trunk's
-single representation ``s`` -- (N_token, 384) -- carries one row per residue.
+single representation ``s`` -- (N_token, c_s) -- carries one row per residue.
 The trainable part is only the per-residue MLP head from model.py
 (head_dim=128 by default, an actual MLP unlike the champion's direct Linear).
 
-Input is the antigen SEQUENCE (the trunk runs MSA-free and template-free via
-opendde's own dummy-feature path, opendde.data.utils.make_dummy_feature --
+Input is the antigen SEQUENCE alone (the trunk runs MSA-free and template-free
+via opendde's own dummy-feature path, opendde.data.utils.make_dummy_feature --
 the same path the shipped CLI takes with --use_msa false, so no mmseqs2 or
-template databases are needed) PLUS the antigen's backbone CA geometry, which
-enters through the confidence lane below.
-
-The pair representation ``z`` -- (N_token, N_token, 384) -- is consumed the
-way OpenDDE itself consumes it: through the checkpoint's own ConfidenceHead
-(AF3 Algorithm 31, opendde/model/modules/confidence.py). OpenDDE never
-averages pair rows -- its recipe is to run MORE PairformerStack blocks over z
-and read per-residue outputs off the single stream. Concretely, the lane
-mirrors ConfidenceHead.forward + memory_efficient_forward exactly:
-
-    z'  = z + outer_sum(linear_s1(s_inputs), linear_s2(s_inputs))  # re-init
-    z' += distance_embedding(CA-CA geometry of the antigen)       # trained bins
-    s'  = confidence_head.pairformer_stack(LN(clamp(s)), z')      # 4 blocks
-
-where the distance embedding is the confidence head's own trained binned
-one-hot + raw-distance projections (LinearNoBias_d / _d_wo_onehot), computed
-from the antigen's ACTUAL CA coordinates -- true geometry where OpenDDE feeds
-its diffusion-predicted coordinates. The cached per-residue features are then
-[s ; s'] -- the trunk single stream plus the confidence-block single stream
-that z and the 3D geometry have flowed into. ``use_pair=False`` (the ablation)
-drops the lane and trains on s alone, sequence-only.
+template databases are needed); no structure is read anywhere -- the
+checkpoint's diffusion module and confidence head are pruned at load time and
+the pair representation the trunk computes is discarded.
 
 Determinism: opendde's Featurizer applies a random rigid transform to the
 reference-conformer positions by default (ref_pos_augment=True); the subclass
 below turns that off, which makes the trunk output bit-identical across
-processes (verified). Recycling and the confidence lane run under no_grad, so
-no gradient ever flows through any frozen module -- gradients reach only the
-head.
+processes (verified). Recycling runs under no_grad, so no gradient ever flows
+through any frozen module -- gradients reach only the head.
 
-Embedding cache: the trunk + confidence lane is expensive (~1 min per
-~350-residue antigen on an A6000, vs milliseconds for the head), and it is
-frozen, so [s ; s'] is cached per (checkpoint, cycles, use_pair, sequence, CA
-geometry) as an .npy under ``emb_cache`` -- O(L), a few MB per antigen -- and
-reused across steps/folds/ablations. The CA-geometry term in the key matters:
-the distance embedding makes the features a function of the structure too, so
-two records sharing a sequence but not a structure get separate entries.
+Embedding cache: the trunk is expensive (~1 min per ~350-residue antigen on
+an A6000, vs milliseconds for the head), and it is frozen, so ``s`` is cached
+per (checkpoint, cycles, chunk size, sequence) as an .npy under ``emb_cache``
+-- O(L), a few MB per antigen -- and reused across steps/folds/ablations.
 train.py points the cache at the coords cache next to --structures. With no
-``emb_cache`` (e.g. predict.py) every forward recomputes the trunk.
+``emb_cache`` (e.g. predict.py) every forward recomputes the trunk. The key
+format deliberately differs from the confidence-lane era's, so cache files
+written by those builds can never be silently reused.
 
 Must run under the opendde environment (python >= 3.11, torch 2.7), NOT the
 fair-esm env -- see machine_config.yaml's env_opendde / opendde_root. train.py
@@ -88,16 +68,17 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CHECKPOINT_NAME = "opendde_abag.pt"
 
-# Submodules OpenDDE's full forward uses that neither get_pairformer_output
-# nor the confidence lane ever touches; deleting them after the checkpoint
-# load cuts resident memory (~656M params -> ~420M with the confidence head
-# kept).
+# Submodules OpenDDE's full forward uses that the trunk-only path never
+# touches; deleting them after the checkpoint load cuts resident memory
+# (~656M params -> ~387M with only the trunk kept -- the confidence head was
+# dropped along with its lane).
 _NON_TRUNK_MODULES = (
     "diffusion_module",
     "distogram_head",
     "structural_token_expander",
     "structural_token_refiner",
     "inference_noise_scheduler",
+    "confidence_head",
 )
 
 
@@ -224,67 +205,11 @@ def _features_for_sequence(seq: str) -> dict:
     return data_type_transform(features)
 
 
-def _ca_coords(coords) -> torch.Tensor:
-    """(L, 3) CA coordinates from the (L, 3, 3) N/CA/C arrays data.py loads.
-    Raises on missing CA atoms (NaN) rather than silently feeding the
-    distance lane wrong geometry."""
-    ca = np.asarray(coords, dtype=np.float32)[:, 1, :]
-    if np.isnan(ca).any():
-        n = int(np.isnan(ca).any(axis=-1).sum())
-        raise ValueError(f"{n} residues are missing CA coordinates -- the "
-                         f"confidence lane's distance embedding needs them")
-    return torch.from_numpy(ca)
-
-
-def _confidence_lane(trunk, s_inputs, s, z, ca: torch.Tensor) -> torch.Tensor:
-    """The checkpoint's own ConfidenceHead recipe, frozen: the per-residue
-    single stream that the pair representation z and the CA-CA geometry have
-    flowed into (see the module docstring for the exact correspondence with
-    ConfidenceHead.forward / memory_efficient_forward)."""
-    from opendde.model.utils import one_hot
-
-    conf = trunk.confidence_head
-    # z' = z + outer_sum(linear_s1(s_inputs), linear_s2(s_inputs)) -- the
-    # confidence head's pair re-initialization (ConfidenceHead.forward's
-    # _prepare_confidence_inputs).
-    z = z + conf.linear_no_bias_s1(s_inputs)[None, :, :] \
-          + conf.linear_no_bias_s2(s_inputs)[:, None, :]
-    # z' += the trained distance embedding, over the antigen's true CA-CA
-    # distances where OpenDDE feeds its diffusion-predicted ones
-    # (memory_efficient_forward's pair-distance embedding).
-    dist = torch.cdist(ca, ca)
-    z = z + conf.linear_no_bias_d(
-        one_hot(x=dist, lower_bins=conf.lower_bins, upper_bins=conf.upper_bins)
-        .to(dtype=conf.linear_no_bias_d.weight.dtype))
-    z = z + conf.linear_no_bias_d_wo_onehot(
-        dist.unsqueeze(dim=-1).to(dtype=conf.linear_no_bias_d_wo_onehot.weight.dtype))
-    # 4 trained PairformerStack blocks on (LN(clamp(s)), z'); pair_mask=None
-    # matches the model's own single-sequence call site (opendde.py:2040).
-    # chunk_size mirrors the model's own inference path (_forward_impl passes
-    # configs.infer_setting.chunk_size) -- unchunked, the triangle ops on a
-    # ~1300-residue antigen alone need >40 GiB.
-    s_ln = conf.input_strunk_ln(torch.clamp(s, min=-512, max=512))
-    s_conf, _ = conf.pairformer_stack(
-        s_ln, z, pair_mask=None,
-        triangle_multiplicative=trunk.configs.triangle_multiplicative,
-        triangle_attention=trunk.configs.triangle_attention,
-        inplace_safe=True,  # no_grad, and z/s_ln are our own fresh tensors
-        chunk_size=trunk.configs.infer_setting.chunk_size)
-    return s_conf
-
-
 @torch.no_grad()
-def _trunk_features(trunk, seq: str, coords, cycles: int,
-                    use_pair: bool) -> np.ndarray:
-    """(len(seq), width) per-residue trunk features -- one row per residue
-    (one protein token per residue), float32.
-
-    ``width`` is the trunk's c_s (the single representation ``s``), doubled
-    when ``use_pair``: the confidence lane's single stream is appended, so
-    the features are [s ; s']. ``coords`` (the (L, 3, 3) N/CA/C array
-    data.load_backbone_coords produces) is required exactly when
-    ``use_pair`` -- its CA geometry feeds the distance embedding.
-    """
+def _trunk_features(trunk, seq: str, cycles: int) -> np.ndarray:
+    """(len(seq), trunk width) per-residue trunk features -- one row per
+    residue (one protein token per residue), float32. Sequence-only: the
+    trunk's single representation ``s``, nothing else."""
     from opendde.model.opendde import update_input_feature_dict
 
     features = _features_for_sequence(seq)
@@ -297,33 +222,23 @@ def _trunk_features(trunk, seq: str, coords, cycles: int,
     # (_forward_impl -> main_inference_loop): we always run no_grad, and
     # unchunked triangle ops are O(L^2) workspace that OOMs the longest
     # antigens even on a 48 GiB card.
-    s_inputs, s, z = trunk.get_pairformer_output(
+    _, s, _ = trunk.get_pairformer_output(
         features, N_cycle=cycles,
         chunk_size=trunk.configs.infer_setting.chunk_size,
         inplace_safe=True)
     if s.shape[0] != len(seq):  # tokenization must stay 1:1 with residues
         raise RuntimeError(f"OpenDDE trunk returned {s.shape[0]} tokens for a "
-                           f"{len(seq)}-residue sequence")
-    lanes = [s]
-    if use_pair:
-        if coords is None:
-            raise ValueError("use_pair=True needs backbone coords -- the "
-                             "confidence lane's distance embedding reads them")
-        ca = _ca_coords(coords).to(dev)
-        lanes.append(_confidence_lane(trunk, s_inputs, s, z, ca))
-    return torch.cat(lanes, dim=-1).detach().float().cpu().numpy()
+                            f"{len(seq)}-residue sequence")
+    return s.detach().float().cpu().numpy()
 
 
 class OpenDDEPairformerEpitopeModel(EpitopeModel):
     """Frozen OpenDDE (ab_ag) Pairformer trunk + per-residue MLP epitope head.
 
-    The head reads the trunk's single representation ``s`` plus (when
-    ``use_pair``, the default) the confidence lane: the checkpoint's own
-    ConfidenceHead blocks run frozen over the pair representation and the
-    antigen's CA-CA geometry, and their output single stream ``s'`` is
-    concatenated onto ``s`` -- so the MLP sees the residue-residue and
-    structural information z carries, processed the way OpenDDE itself
-    processes it (see the module docstring), not a hand-rolled summary of it.
+    Sequence-only: the head reads the trunk's single representation ``s``
+    (one row per residue) and nothing else -- no structure, no pair
+    representation, no confidence head. ``coords`` passed to forward() is
+    ignored, like every other sequence-only epiLoRA backbone.
 
     ``emb_cache`` (optional) is a directory the frozen trunk's per-sequence
     features are cached in (see the module docstring); it is runtime-only
@@ -333,51 +248,39 @@ class OpenDDEPairformerEpitopeModel(EpitopeModel):
     """
 
     def __init__(self, trunk, cycles: int = 10, dropout: float = 0.1,
-                 head_dim: int | None = 128, extra_feats=(), use_pair: bool = True,
+                 head_dim: int | None = 128, extra_feats=(),
                  checkpoint=None, emb_cache=None):
         super().__init__()
         self.opendde = trunk
         self.cycles = int(cycles)
-        self.use_pair = bool(use_pair)
         self._cfg = dict(cycles=self.cycles, dropout=dropout, head_dim=head_dim,
-                         use_pair=self.use_pair, extra_feats=list(extra_feats),
+                         extra_feats=list(extra_feats),
                          checkpoint=None if checkpoint is None else str(checkpoint))
         self._emb_cache = Path(emb_cache) if emb_cache is not None else None
         for p in self.opendde.parameters():
             p.requires_grad = False
-        # Trunk width read off the loaded model (configs.c_s), not hardcoded;
-        # the confidence lane doubles it when enabled.
-        self._init_head(int(trunk.c_s) * (2 if self.use_pair else 1),
-                        dropout, head_dim, extra_feats)
+        # Trunk width read off the loaded model (configs.c_s), not hardcoded.
+        self._init_head(int(trunk.c_s), dropout, head_dim, extra_feats)
 
-    def _emb_cache_path(self, seq: str, coords) -> Path | None:
+    def _emb_cache_path(self, seq: str) -> Path | None:
         """Cache file for this sample's trunk features -- keyed by (checkpoint,
-        cycles, use_pair, chunk size, sequence, CA geometry). The geometry
-        term matters: with use_pair the distance embedding makes the features
-        a function of the structure, so two records sharing a sequence but
-        not a structure must not share a cache entry (and changing the
-        checkpoint, recycling depth, or trunk chunking can never silently
-        reuse stale or wrong-shaped embeddings either)."""
+        cycles, chunk size, sequence). The key format deliberately differs
+        from the confidence-lane era's (which also hashed the CA geometry and
+        a use_pair flag), so files written by those builds can never be
+        silently reused here."""
         if self._emb_cache is None:
             return None
         ckpt = self._cfg.get("checkpoint") or DEFAULT_CHECKPOINT_NAME
-        if self.use_pair and coords is not None:
-            geo = hashlib.sha1(
-                np.asarray(coords, dtype=np.float32)[:, 1, :].tobytes()
-            ).hexdigest()
-        else:
-            geo = "nogeo"
         chunk = self.opendde.configs.infer_setting.chunk_size
         key = hashlib.sha1(
-            f"{Path(ckpt).stem}|{self.cycles}|{int(self.use_pair)}|{chunk}|{geo}|{seq}"
+            f"seqonly|{Path(ckpt).stem}|{self.cycles}|{chunk}|{seq}"
             .encode()).hexdigest()
         return self._emb_cache / f"opendde_trunk_{key}.npy"
 
-    def _trunk_features_cached(self, seq: str, coords) -> torch.Tensor:
+    def _trunk_features_cached(self, seq: str) -> torch.Tensor:
         """(len(seq), head input width) trunk features, cached if a cache dir
-        was given (the trunk + confidence lane are frozen, so their output
-        never changes)."""
-        cache_path = self._emb_cache_path(seq, coords)
+        was given (the trunk is frozen, so its output never changes)."""
+        cache_path = self._emb_cache_path(seq)
         arr = None
         if cache_path is not None and cache_path.exists():
             try:
@@ -386,8 +289,7 @@ class OpenDDEPairformerEpitopeModel(EpitopeModel):
                 logger.warning(f"could not read cache {cache_path}: {e}; "
                                f"recomputing")
         if arr is None:
-            arr = _trunk_features(self.opendde, seq, coords, self.cycles,
-                                  self.use_pair)
+            arr = _trunk_features(self.opendde, seq, self.cycles)
             if cache_path is not None:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = cache_path.with_name(f"{cache_path.name}.tmp{os.getpid()}")
@@ -401,34 +303,32 @@ class OpenDDEPairformerEpitopeModel(EpitopeModel):
         return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
 
     def _encode(self, coords_batch, seq_batch):
-        """``coords_batch`` is the (L, 3, 3) N/CA/C array data.load_backbone_coords
-        produces -- required when use_pair (its CA geometry feeds the distance
-        embedding), ignored otherwise.
+        """Sequence-only: ``coords_batch`` is ignored (the base-class forward
+        passes it to every backbone; sequence-only ones don't read it).
 
         Only batch size 1 is supported (mirrors ESM3/ESMc; train.py only ever
         calls forward() with single-element lists)."""
         if len(seq_batch) != 1:
             raise ValueError("OpenDDEPairformerEpitopeModel only supports "
                              "batch size 1")
-        feats = self._trunk_features_cached(seq_batch[0], coords_batch[0])
+        feats = self._trunk_features_cached(seq_batch[0])
         pad = feats.new_zeros(1, 1, feats.shape[-1])        # stand-in "begin" token
         return torch.cat([pad, feats.unsqueeze(0)], dim=1)  # (1, 1+L, width)
 
 
 def build_model_opendde(device: str = "cpu", checkpoint=None, cycles: int = 10,
                         dropout: float = 0.1, head_dim: int | None = 128,
-                        extra_feats=(), use_pair: bool = True,
-                        emb_cache=None) -> "OpenDDEPairformerEpitopeModel":
+                        extra_feats=(), emb_cache=None) -> "OpenDDEPairformerEpitopeModel":
     """Build an (untrained) OpenDDE-trunk epiLoRA model on ``device``.
 
     ``head_dim`` defaults to 128 (an MLP head), unlike the esmif1 champion's
-    direct Linear -- that is this backbone's default recipe. ``use_pair``
-    adds the confidence lane to the head's input (see the class docstring).
+    direct Linear -- that is this backbone's default recipe. Sequence-only:
+    no structure is read anywhere.
     """
     ckpt = resolve_opendde_checkpoint(checkpoint)
     trunk = load_base_opendde(ckpt, device=device)
     model = OpenDDEPairformerEpitopeModel(trunk, cycles=cycles, dropout=dropout,
                                           head_dim=head_dim, extra_feats=extra_feats,
-                                          use_pair=use_pair, checkpoint=ckpt,
+                                          checkpoint=ckpt,
                                           emb_cache=emb_cache).to(device)
     return model

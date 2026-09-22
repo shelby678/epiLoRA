@@ -87,16 +87,12 @@ class TrainConfig:
     esmc_size: str = "600M"            # 300M or 600M (only used when backbone=esmc)
     prott5_size: str = "xl"            # only used when backbone=prott5 (see model.PROTT5_NAMES)
     # OpenDDE Pairformer trunk (only used when backbone=opendde; see
-    # models/opendde/): recycling cycles (the ab_ag inference default), the
-    # trunk checkpoint -- None resolves to <opendde root>/checkpoint/
-    # opendde_abag.pt (OPENDDE_ROOT_DIR / machine_config.yaml's opendde_root)
-    # -- and whether the head also reads the confidence lane: the checkpoint's
-    # own ConfidenceHead blocks run frozen over the pair representation and
-    # the antigen's CA geometry (OpenDDE's own pair->single mechanism, see
-    # models/opendde/).
+    # models/opendde/, sequence-only): recycling cycles (the ab_ag inference
+    # default) and the trunk checkpoint -- None resolves to <opendde root>/
+    # checkpoint/opendde_abag.pt (OPENDDE_ROOT_DIR / machine_config.yaml's
+    # opendde_root).
     opendde_cycles: int = 10
     opendde_checkpoint: Optional[Path] = None
-    opendde_pair: bool = True
     lora_rank: int = 4
     lora_alpha: float = 8.0
     lora_layers: int = 8               # number of top transformer layers to adapt with LoRA
@@ -180,10 +176,9 @@ def evaluate_auc(model, samples) -> float:
         try:
             lg = model([coords], [seq], [feats])[0].cpu().numpy()
         except Exception as e:
-            # Skip-and-count like the training loop (a structure the backbone
-            # can't score -- e.g. a residue missing its CA, which the OpenDDE
-            # confidence lane needs). Logged loudly so a benchmark never
-            # silently loses samples it used to include.
+            # Skip-and-count like the training loop (a sample the backbone
+            # can't score). Logged loudly so a benchmark never silently loses
+            # samples it used to include.
             n_failed += 1
             logger.warning(f"evaluate_auc: skipping {header!r}: forward failed: {e}")
             continue
@@ -458,19 +453,16 @@ def main() -> None:
     elif cfg.backbone == "opendde":
         # Frozen OpenDDE Pairformer trunk (ab_ag) + head; must run under the
         # opendde env (machine_config.yaml's env_opendde), not fair-esm's.
-        # head_dim: the opendde recipe's default is an MLP head (128) when the
-        # config doesn't set one; use_pair feeds the head the confidence lane
-        # too (the checkpoint's ConfidenceHead blocks over the pair matrix +
-        # CA geometry). emb_cache: the trunk is frozen and slow, so its
-        # per-sample features are cached next to the structures like the
-        # coords/RSA caches are.
+        # Sequence-only. head_dim: the opendde recipe's default is an MLP head
+        # (128) when the config doesn't set one. emb_cache: the trunk is
+        # frozen and slow, so its per-sample features are cached next to the
+        # structures like the coords/RSA caches are.
         from model import build_model_opendde
         from data import default_cache_dir
         model = build_model_opendde(device=DEVICE, checkpoint=cfg.opendde_checkpoint,
                                      cycles=cfg.opendde_cycles, dropout=cfg.dropout,
                                      head_dim=(cfg.head_dim if cfg.head_dim is not None else 128),
                                      extra_feats=cfg.extra_feats,
-                                     use_pair=cfg.opendde_pair,
                                      emb_cache=default_cache_dir(args.structures))
     elif cfg.backbone in ("prostt5", "prott5"):
         # Both are the same frozen-T5-encoder wrapper; only the pretrained

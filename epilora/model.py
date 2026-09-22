@@ -589,19 +589,18 @@ def build_model_prostt5(device: str = "cpu", name: str = "Rostlab/ProstT5",
 # The OpenDDE co-folding model's trunk (InputFeatureEmbedder + MSA module +
 # 48-block PairformerStack, from the antibody-antigen-tuned opendde_abag.pt
 # checkpoint), frozen, with the standard epiLoRA per-residue head on its
-# single representation -- one row per residue -- plus a confidence lane: the
-# checkpoint's own ConfidenceHead blocks run frozen over the pair
-# representation and the antigen's CA geometry (how OpenDDE itself turns the
-# pair matrix into per-residue signal). Sequence-only trunk input, run
-# MSA-free/template-free, so no search databases are needed. The actual
-# implementation lives in models/opendde/ (it needs the opendde pip package,
-# which cannot be installed next to fair-esm); this section re-exposes it so
-# every backbone stays reachable from model.py, like the sections above.
+# single representation -- one row per residue. Sequence-only: no structure
+# is read anywhere (the checkpoint's diffusion module and confidence head are
+# pruned at load time), and the trunk runs MSA-free/template-free, so no
+# search databases are needed either. The actual implementation lives in
+# models/opendde/ (it needs the opendde pip package, which cannot be installed
+# next to fair-esm); this section re-exposes it so every backbone stays
+# reachable from model.py, like the sections above.
 #
 # Must run under the opendde environment, NOT the fair-esm env -- see
 # machine_config.yaml's env_opendde (python >= 3.11, torch 2.7, opendde).
-# The trunk output is cached per sequence+geometry (emb_cache) since it is
-# frozen; see models/opendde/model.py's docstring for details.
+# The trunk output is cached per sequence (emb_cache) since it is frozen; see
+# models/opendde/model.py's docstring for details.
 
 
 def load_base_opendde(checkpoint=None, device: str = "cpu"):
@@ -612,18 +611,14 @@ def load_base_opendde(checkpoint=None, device: str = "cpu"):
 
 def build_model_opendde(device: str = "cpu", checkpoint=None, cycles: int = 10,
                 dropout: float = 0.1, head_dim: int | None = 128,
-                extra_feats=(), use_pair: bool = True,
-                emb_cache=None) -> "OpenDDEPairformerEpitopeModel":
+                extra_feats=(), emb_cache=None) -> "OpenDDEPairformerEpitopeModel":
     """Build an (untrained) OpenDDE-trunk epiLoRA model on ``device``.
 
     ``head_dim`` defaults to 128 (an MLP head), unlike the esmif1 champion's
-    direct Linear; ``use_pair`` feeds the head the confidence lane (the
-    checkpoint's ConfidenceHead blocks over the pair representation + CA
-    geometry, see models/opendde/); ``emb_cache`` optionally caches the frozen
-    trunk's per-sample features (train.py passes the coords cache dir).
+    direct Linear; ``emb_cache`` optionally caches the frozen trunk's
+    per-sample features (train.py passes the coords cache dir).
     """
     from models.opendde import build_model_opendde
     return build_model_opendde(device=device, checkpoint=checkpoint, cycles=cycles,
                                dropout=dropout, head_dim=head_dim,
-                               extra_feats=extra_feats, use_pair=use_pair,
-                               emb_cache=emb_cache)
+                               extra_feats=extra_feats, emb_cache=emb_cache)

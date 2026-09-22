@@ -1,14 +1,16 @@
-"""Run the trained epiLoRA model on an antigen structure.
+"""Run the trained epiLoRA model on an antigen.
 
     python predict.py --pdb antigen.pdb --chain A --weights weights/epilora_if1.pt
+    python predict.py --sequence MKTAYIAKQRQISFVKSHFSRQ --weights weights/opendde_fold1.pt
 
 Prints per-residue epitope probabilities (and writes a CSV with ``--out``).
 ESM-IF1 (the champion) is an inverse-folding model, so its input is a PDB
 structure + chain and the sequence is read from the structure itself; the
-sequence-only backbones (ESM2/ESM3/ESMc/ProstT5) read just the chain's residue
-sequence; the OpenDDE backbone reads the sequence plus the chain's CA geometry
-(its confidence lane, see models/opendde/). Structure-reading needs fair-esm's
-util (fair-esm env); the other backbones run in any env that can load their
+sequence-only backbones (ESM2/ESM3/ESMc/ProstT5/ProtT5/OpenDDE) read just the
+residue sequence -- either from a --pdb chain or straight from ``--sequence``
+(a bare one-letter-code string or a single-record FASTA file), so no
+structure is needed for them. Structure-reading needs fair-esm's util
+(fair-esm env); the other backbones run in any env that can load their
 checkpoint -- esm3/esmc under epilora/env_esm3, opendde under
 machine_config.yaml's env_opendde.
 """
@@ -24,9 +26,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from data import (backbone_coords_for_structure_file, build_extra_feats,
-                  parse_structure_model, rsa_for_structure_file, select_residues)
+from data import (build_extra_feats, parse_structure_model,
+                  rsa_for_structure_file, select_residues)
 from model import ESMIF1EpitopeModel, load_base_esmif1
+
+# One-letter codes the sequence-only backbones accept from --sequence: the
+# 20 standard amino acids plus the ambiguity/unknown codes PDB tools emit.
+AA_LETTERS = set("ACDEFGHIKLMNPQRSTVWYBXZUO")
 
 
 def load_model(weights: Path, device: str, emb_cache=None) -> nn.Module:
@@ -76,10 +82,11 @@ def predict(model: ESMIF1EpitopeModel, coords, seq, feats=None) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-logits))  # sigmoid -> per-residue probability
 
 
-def extra_feats_for(model, structure_path: Path, chain: str, seq: str):
-    """The extra per-residue head features ``model`` needs for this chain, or
-    None if its head reads the embedding alone. RSA is computed on the given
-    chain alone, matching training -- so pass an antigen structure."""
+def extra_feats_for(model, structure_path: Path | None, chain, seq: str):
+    """The extra per-residue head features ``model`` needs, or None if its
+    head reads the embedding alone. RSA is computed on the given chain alone,
+    matching training -- so pass an antigen structure (None is fine for heads
+    that don't read rsa)."""
     if not model.n_extra_feats:
         return None
     rsa = (rsa_for_structure_file(structure_path, [chain], len(seq))
@@ -102,10 +109,43 @@ def chain_sequence(structure_path: Path, chain: str) -> str:
     return "".join(protein_letters_3to1.get(r.resname, "X") for r in residues)
 
 
+def sequence_from_arg(value: str) -> str:
+    """The antigen sequence from predict.py's ``--sequence``: a FASTA file
+    with exactly one record, or a bare one-letter-code string (whitespace
+    ignored, case-insensitive)."""
+    path = Path(value)
+    if path.exists():
+        records, seq, in_record = [], [], False
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(">"):
+                if in_record:
+                    records.append("".join(seq))
+                seq, in_record = [], True
+            elif in_record and line:
+                seq.append(line)
+        if in_record:
+            records.append("".join(seq))
+        if len(records) != 1:
+            raise ValueError(f"{path}: expected exactly one FASTA record, "
+                             f"found {len(records)}")
+        return records[0]
+    s = "".join(value.split()).upper()
+    if not s or not set(s) <= AA_LETTERS:
+        raise ValueError("--sequence must be one-letter amino-acid codes or "
+                         "the path of an existing FASTA file")
+    return s
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pdb", type=Path, required=True, help="antigen PDB file")
+    p.add_argument("--pdb", type=Path, default=None,
+                   help="antigen structure file (required for the esmif1 backbone; "
+                        "the sequence-only backbones read the sequence of --chain from it)")
+    p.add_argument("--sequence", type=str, default=None,
+                   help="antigen residue sequence (one-letter codes) or a single-record "
+                        "FASTA file -- the sequence-only backbones' structure-free input")
     p.add_argument("--chain", default=None, help="chain id (default: first chain)")
     p.add_argument("--weights", type=Path, default=Path("weights/epilora_if1.pt"))
     p.add_argument("--out", type=Path, default=None, help="optional CSV output path")
@@ -118,42 +158,59 @@ def main() -> None:
                 f"or train one with train.py.")
 
     # Which backbone this checkpoint trained -- esmif1 reads the structure's
-    # coordinates, every other backbone reads the chain sequence alone.
+    # coordinates, every other backbone reads the residue sequence alone
+    # (from --sequence or from --pdb's chain).
     backbone = torch.load(args.weights, map_location="cpu",
                           weights_only=False).get("backbone", "esmif1")
 
-    chain = args.chain
-    if chain is None:
-        if backbone == "esmif1":
-            import esm.inverse_folding.util as ifu
-            chains = ifu.get_chains(ifu.load_structure(str(args.pdb)))
-        else:
-            structure = parse_structure_model(args.pdb)
-            chains = [] if structure is None else [c.id for c in structure.get_chains()]
-        if not chains:
-            p.error(f"no chains found in {args.pdb}")
-        chain = chains[0]
-        print(f"[predict] no --chain given; using first chain '{chain}'", file=sys.stderr)
+    if (args.pdb is None) == (args.sequence is None):
+        p.error("give exactly one of --pdb or --sequence")
+    if args.sequence is not None and backbone == "esmif1":
+        p.error("--sequence is only for the sequence-only backbones; esmif1 "
+                "reads a structure (--pdb)")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    chain = args.chain
     if backbone == "esmif1":
+        if chain is None:
+            import esm.inverse_folding.util as ifu
+            chains = ifu.get_chains(ifu.load_structure(str(args.pdb)))
+            if not chains:
+                p.error(f"no chains found in {args.pdb}")
+            chain = chains[0]
+            print(f"[predict] no --chain given; using first chain '{chain}'", file=sys.stderr)
         from esm.inverse_folding.util import load_coords
         coords, seq = load_coords(str(args.pdb), chain)
-    elif backbone == "opendde":
-        # The trunk reads sequence; its confidence lane additionally reads the
-        # CA geometry (see models/opendde/) -- both without fair-esm.
-        seq = chain_sequence(args.pdb, chain)
-        coords = backbone_coords_for_structure_file(args.pdb, [chain], len(seq))
     else:
-        coords, seq = None, chain_sequence(args.pdb, chain)
+        coords = None
+        if args.sequence is not None:
+            try:
+                seq = sequence_from_arg(args.sequence)
+            except ValueError as e:
+                p.error(str(e))
+        else:
+            if chain is None:
+                structure = parse_structure_model(args.pdb)
+                chains = [] if structure is None else [c.id for c in structure.get_chains()]
+                if not chains:
+                    p.error(f"no chains found in {args.pdb}")
+                chain = chains[0]
+                print(f"[predict] no --chain given; using first chain '{chain}'", file=sys.stderr)
+            seq = chain_sequence(args.pdb, chain)
+
     model = load_model(args.weights, device)
+    if model.n_extra_feats and "rsa" in model.extra_feats and args.pdb is None:
+        p.error("this checkpoint's head reads the rsa feature, which is computed "
+                "from a structure -- rerun with --pdb instead of --sequence")
     feats = extra_feats_for(model, args.pdb, chain, seq)
     if feats is not None:
         print(f"[predict] head reads extra features: {', '.join(model.extra_feats)}",
               file=sys.stderr)
     probs = predict(model, coords, seq, feats)
 
-    print(f"# {args.pdb} chain {chain}: {len(seq)} residues  (val_auc-trained model)")
+    src = (f"{args.pdb} chain {chain}" if args.pdb is not None and chain is not None
+           else str(args.pdb) if args.pdb is not None else "--sequence input")
+    print(f"# {src}: {len(seq)} residues  (val_auc-trained model)")
     print("pos\taa\tprob\tepitope")
     for i, (aa, pr) in enumerate(zip(seq, probs), start=1):
         print(f"{i}\t{aa}\t{pr:.4f}\t{'1' if pr >= args.threshold else '0'}")

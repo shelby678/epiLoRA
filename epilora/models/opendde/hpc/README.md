@@ -1,7 +1,7 @@
 # OpenDDE backbone benchmark on Slurm (32-way GPU)
 
-Runs the full benchmark — frozen OpenDDE ab_ag Pairformer trunk + confidence
-lane + MLP head, champion dataset, 5-fold CV, held-out final eval — as a
+Runs the full benchmark — frozen OpenDDE ab_ag Pairformer trunk (sequence-only)
++ MLP head, champion dataset, 5-fold CV, held-out final eval — as a
 three-phase Slurm dependency chain, using 32 GPUs in parallel for the
 expensive part (the per-antigen trunk precompute; ~3 days serial, ~2-3 h
 sharded 32-way).
@@ -86,5 +86,7 @@ predictions, comparable against DiscoTope's).
 - **rtxp6000 partition**: use the campaign's baked-driver image recipe
   instead (opendde_coreweave/container/Dockerfile) + pyyaml — the b200 image
   carries no driver libs and will silently fall back to CPU there.
-- A handful of antigens with missing CA atoms are skipped (logged) in
-  training and eval alike — same behavior as the local run.
+- A handful of antigens without a usable structure (unparseable file, absent
+  chain, or a sequence that doesn't line up with its residues) are skipped
+  (logged) in training and eval alike — the shared data gate every backbone
+  trains through, same behavior as the local run.

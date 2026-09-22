@@ -4,12 +4,12 @@
 
 Each task takes a disjoint slice of the records every training/eval run
 needs (the champion training FASTA + the two shared-benchmark eval FASTAs +
-the final held-out eval set), runs the frozen trunk + confidence lane once
-per record, and writes the per-residue [s ; s'] features to the shared
-embedding cache. The cache (atomic writes) makes shards safe to run
-concurrently and the whole thing resumable: re-running a shard skips every
-entry already on disk, so a preempted (--requeue) or resubmitted array loses
-at most the one in-flight record.
+the final held-out eval set), runs the frozen sequence-only trunk once per
+record, and writes the per-residue features to the shared embedding cache.
+The cache (atomic writes) makes shards safe to run concurrently and the whole
+thing resumable: re-running a shard skips every entry already on disk, so a
+preempted (--requeue) or resubmitted array loses at most the one in-flight
+record.
 
 Load balancing: records are sorted by sequence length (descending) and
 dealt round-robin, so every shard gets an ~equal sum of L^2 -- the trunk's
@@ -103,7 +103,7 @@ def main():
             n_skip += 1  # unusable in training either way (usable() skips them)
             continue
         try:
-            model._trunk_features_cached(seq, coords)
+            model._trunk_features_cached(seq)
             n_cached += 1
         except Exception as e:  # bad CA, OOM, ... -- training skips these too
             n_fail += 1
