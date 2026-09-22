@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 
-from data import load_samples, parse_fasta
+from data import default_cache_dir, load_samples, parse_fasta
 from predict import load_model
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -60,11 +60,15 @@ def main() -> None:
     p.add_argument("--eval-fasta", type=Path, default=REPO_ROOT /
                    "data/train_test_eval/eval/allowed_species_homo_sapiens_min_resolution_5_epitopes.fasta")
     p.add_argument("--structures", type=Path, default=REPO_ROOT / "data/raw/all-structures-extracted")
+    p.add_argument("--emb-cache", type=Path, default=None,
+                   help="trunk-feature cache dir for the opendde backbone "
+                        "(default: the coords cache next to --structures, matching train.py)")
     p.add_argument("--out", type=Path, default=None, help="optional per-residue CSV output")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    models = [load_model(w, device) for w in args.weights]
+    emb_cache = args.emb_cache or default_cache_dir(args.structures)
+    models = [load_model(w, device, emb_cache=emb_cache) for w in args.weights]
     feat_names = {m.extra_feats for m in models}
     if len(feat_names) > 1:
         raise SystemExit("cannot ensemble checkpoints whose heads read different extra "

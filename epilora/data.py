@@ -417,6 +417,32 @@ def rsa_for_structure_file(path: Path, chain_ids: list[str], seq_len: int) -> np
     return residue_rsa(residues, path)
 
 
+def backbone_coords_for_structure_file(path: Path, chain_ids: list[str],
+                                       seq_len: int) -> np.ndarray:
+    """Uncached (seq_len, 3, 3) N/CA/C coords for an arbitrary PDB/mmCIF file
+    (the prediction-time counterpart of load_backbone_coords, for backbones
+    that read structure but must not depend on fair-esm -- e.g. the OpenDDE
+    trunk's confidence lane). Raises on the same conditions
+    rsa_for_structure_file does; missing atoms stay NaN, as in training."""
+    model = parse_structure_model(path)
+    if model is None:
+        raise ValueError(f"could not parse structure {path}")
+    residues = select_residues(model, chain_ids, path)
+    if residues is None:
+        raise ValueError(f"chain(s) {chain_ids} not found in {path}")
+    if len(residues) != seq_len:
+        raise ValueError(
+            f"{path} chain(s) {'|'.join(chain_ids)}: found {len(residues)} standard "
+            f"amino-acid residues but the scored sequence has {seq_len} -- cannot "
+            f"line up per-residue features with the sequence")
+    coords = np.full((seq_len, 3, 3), np.nan, dtype=np.float32)
+    for ri, res in enumerate(residues):
+        for ai, an in enumerate(["N", "CA", "C"]):
+            if an in res:
+                coords[ri, ai] = res[an].coord
+    return coords
+
+
 def load_surface_masks(path: Path, entries: list) -> dict:
     """Per-residue surface masks for ``entries`` from a make_surface_fasta.py FASTA.
 

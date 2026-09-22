@@ -30,6 +30,10 @@ adapters, the RYS-replayed encoder layers, and the head are saved (~a few
 MB); the frozen ESM-IF1 backbone is re-downloaded at load time.
 
 Must run in the fair-esm (py3.9) environment — see README / requirements.txt.
+Two backbones need their own envs instead: esm3/esmc (epilora/env_esm3,
+EvolutionaryScale's ``esm`` package collides with fair-esm's) and opendde
+(models/opendde/, needs the opendde package's python >= 3.11 / torch 2.7 env
+— machine_config.yaml's env_opendde).
 """
 
 from __future__ import annotations
@@ -78,10 +82,21 @@ class TrainConfig:
     Job-identity args (--fasta/--structures/--out/--fold/--seed) are not part
     of this config; they stay plain train.py flags.
     """
-    backbone: str = "esmif1"           # esmif1, esm2, esm3, esmc, prostt5, or prott5
+    backbone: str = "esmif1"           # esmif1, esm2, esm3, esmc, prostt5, prott5, or opendde
     esm2_size: str = "650M"            # 35M, 150M, or 650M (only used when backbone=esm2)
     esmc_size: str = "600M"            # 300M or 600M (only used when backbone=esmc)
     prott5_size: str = "xl"            # only used when backbone=prott5 (see model.PROTT5_NAMES)
+    # OpenDDE Pairformer trunk (only used when backbone=opendde; see
+    # models/opendde/): recycling cycles (the ab_ag inference default), the
+    # trunk checkpoint -- None resolves to <opendde root>/checkpoint/
+    # opendde_abag.pt (OPENDDE_ROOT_DIR / machine_config.yaml's opendde_root)
+    # -- and whether the head also reads the confidence lane: the checkpoint's
+    # own ConfidenceHead blocks run frozen over the pair representation and
+    # the antigen's CA geometry (OpenDDE's own pair->single mechanism, see
+    # models/opendde/).
+    opendde_cycles: int = 10
+    opendde_checkpoint: Optional[Path] = None
+    opendde_pair: bool = True
     lora_rank: int = 4
     lora_alpha: float = 8.0
     lora_layers: int = 8               # number of top transformer layers to adapt with LoRA
@@ -139,6 +154,8 @@ def load_config(path: Path | None) -> TrainConfig:
         raise ValueError(f"{path}: unknown config key(s) {sorted(unknown)}")
     if "eval_fastas" in overrides:
         overrides["eval_fastas"] = [Path(p) for p in overrides["eval_fastas"]]
+    if overrides.get("opendde_checkpoint") is not None:
+        overrides["opendde_checkpoint"] = Path(overrides["opendde_checkpoint"])
     cfg = dataclasses.replace(cfg, **overrides)
     logger.info(f"Loaded config from {path}:")
     print_config(cfg)
@@ -155,7 +172,7 @@ def usable(model, sample) -> bool:
 @torch.no_grad()
 def evaluate_auc(model, samples) -> float:
     model.eval()
-    logits_all, labels_all = [], []
+    logits_all, labels_all, n_failed = [], [], 0
     for sample in samples:
         header, seq, labels, coords, feats = sample
         if not usable(model, sample):
@@ -163,9 +180,18 @@ def evaluate_auc(model, samples) -> float:
         try:
             lg = model([coords], [seq], [feats])[0].cpu().numpy()
         except Exception as e:
-            raise RuntimeError(f"evaluate_auc: forward pass failed on {header!r}: {e}") from e
+            # Skip-and-count like the training loop (a structure the backbone
+            # can't score -- e.g. a residue missing its CA, which the OpenDDE
+            # confidence lane needs). Logged loudly so a benchmark never
+            # silently loses samples it used to include.
+            n_failed += 1
+            logger.warning(f"evaluate_auc: skipping {header!r}: forward failed: {e}")
+            continue
         logits_all.append(lg)
         labels_all.append(labels)
+    if n_failed:
+        logger.warning(f"evaluate_auc: {n_failed}/{len(samples)} samples skipped "
+                       f"after forward failures")
     if not logits_all:
         raise RuntimeError(f"evaluate_auc: no scorable samples among {len(samples)} given")
     y, s = np.concatenate(labels_all), np.concatenate(logits_all)
@@ -365,11 +391,12 @@ def main() -> None:
     if not val_entries:
         p.error(f"no '{val_label}' records in {cfg.eval_fastas[0]}")
 
-    if cfg.extra_feats and cfg.backbone != "esmif1":
-        # Only the ESM-IF1 builder takes extra_feats so far -- fail loudly
-        # rather than silently training without them.
-        p.error(f"extra_feats={cfg.extra_feats} is only wired for backbone=esmif1, "
-                f"not {cfg.backbone!r}")
+    if cfg.extra_feats and cfg.backbone not in ("esmif1", "opendde"):
+        # Only those two builders take extra_feats so far -- fail loudly
+        # rather than silently training without them. (The opendde env needs
+        # freesasa installed for the "rsa" feature; "aa"/"length" work as is.)
+        p.error(f"extra_feats={cfg.extra_feats} is only wired for backbone=esmif1 "
+                f"or opendde, not {cfg.backbone!r}")
 
     loss_weights = None
     surface_fasta = None
@@ -428,6 +455,23 @@ def main() -> None:
         model = build_model_esmc(device=DEVICE, size=cfg.esmc_size, rank=cfg.lora_rank,
                                  alpha=cfg.lora_alpha, n_lora_layers=cfg.lora_layers,
                                  dropout=cfg.dropout, head_dim=cfg.head_dim)
+    elif cfg.backbone == "opendde":
+        # Frozen OpenDDE Pairformer trunk (ab_ag) + head; must run under the
+        # opendde env (machine_config.yaml's env_opendde), not fair-esm's.
+        # head_dim: the opendde recipe's default is an MLP head (128) when the
+        # config doesn't set one; use_pair feeds the head the confidence lane
+        # too (the checkpoint's ConfidenceHead blocks over the pair matrix +
+        # CA geometry). emb_cache: the trunk is frozen and slow, so its
+        # per-sample features are cached next to the structures like the
+        # coords/RSA caches are.
+        from model import build_model_opendde
+        from data import default_cache_dir
+        model = build_model_opendde(device=DEVICE, checkpoint=cfg.opendde_checkpoint,
+                                     cycles=cfg.opendde_cycles, dropout=cfg.dropout,
+                                     head_dim=(cfg.head_dim if cfg.head_dim is not None else 128),
+                                     extra_feats=cfg.extra_feats,
+                                     use_pair=cfg.opendde_pair,
+                                     emb_cache=default_cache_dir(args.structures))
     elif cfg.backbone in ("prostt5", "prott5"):
         # Both are the same frozen-T5-encoder wrapper; only the pretrained
         # weights differ (see model.PROTT5_NAMES).

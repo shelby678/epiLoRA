@@ -9,3 +9,13 @@ env: env
 # EvolutionaryScale's `esm` pip package collides by import name with
 # fair-esm's `esm` and the two can't be installed together.
 env_esm3: env_esm3
+
+# OpenDDE env (models/opendde/: frozen Pairformer trunk + head). The opendde
+# pip package needs python >= 3.11 / torch 2.7, which fair-esm's env can't
+# host; on this machine it lives in the opendde_coreweave checkout's venv.
+env_opendde: /home/sferrier/opendde_coreweave/.venv
+
+# OpenDDE assets root (checkpoint/opendde_abag.pt + common/ CCD files), same
+# layout as $OPENDDE_ROOT_DIR. train.py/predict.py run under env_opendde read
+# this when OPENDDE_ROOT_DIR is unset.
+opendde_root: /home/sferrier/.cache/opendde

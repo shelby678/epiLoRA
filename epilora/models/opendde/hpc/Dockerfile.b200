@@ -1,0 +1,57 @@
+# =============================================================================
+# epiLoRA OpenDDE-backbone image for the b200 partition.
+#
+# Same recipe as opendde_coreweave/container/Dockerfile.b200 (the campaign
+# image -- see that repo's container/README.md for the driver story: b200
+# nodes run a real host driver that pyxis/enroot injects at runtime, so NO
+# driver libs are baked in here, and the base's cuda-compat package is purged
+# so nothing shadows the injected libcuda), plus the one package the epiLoRA
+# training code needs that opendde does not pull in: pyyaml (train.py's
+# --config parsing).
+#
+# Not included (add to the uv install line if ever needed): wandb (only for
+# --wandb runs), freesasa (only for the rsa extra head feature).
+# =============================================================================
+FROM docker.io/nvidia/cuda:12.8.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# gcc/libc6-dev: Triton JIT-compiles its cuda_utils (-lcuda) on first use per
+# node (the cuEquivariance kernels pulled in by opendde[gpu] go through it).
+# pigz: result tarring. cuda-compat purge: keep anything from shadowing the
+# host driver enroot injects (CUDA error 803 otherwise).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 ca-certificates procps \
+        curl pigz gcc libc6-dev \
+    && apt-get purge -y cuda-compat-12-8 \
+    && rm -rf /usr/local/cuda-12.8/compat /var/lib/apt/lists/*
+
+# s5cmd (CoreWeave fork) — for moving results to/from object storage.
+ARG S5CMD_VERSION=2.3.0-acb67716
+RUN curl -fsSL -o /tmp/s5cmd.deb \
+        "https://github.com/coreweave/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_linux_amd64.deb" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/s5cmd.deb \
+    && rm -rf /tmp/s5cmd.deb /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# The opendde env: uv-managed Python 3.11 + `opendde[gpu]` on the cu128
+# torch backend (b200 = sm_100), + pyyaml for epiLoRA's train.py.
+# -----------------------------------------------------------------------------
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv venv --python 3.11 /opt/opendde \
+    && uv pip install --python /opt/opendde/bin/python --no-cache \
+           --torch-backend cu128 \
+           "opendde[gpu]" \
+           pyyaml
+
+ENV PATH=/opt/opendde/bin:${PATH}
+
+# Dev-name alias for the driver enroot injects at runtime: Triton links with
+# -lcuda (libcuda.so) but only libcuda.so.1 is ever mounted in. Dangling on
+# purpose — resolves once the host driver lands at that path. MUST come after
+# every apt-get (dpkg triggers ldconfig, which prunes dangling symlinks).
+RUN ln -s libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so
