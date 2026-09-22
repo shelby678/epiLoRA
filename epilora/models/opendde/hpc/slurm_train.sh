@@ -20,7 +20,10 @@
 #SBATCH --open-mode=append
 
 #SBATCH --container-image=/mnt/data/sferrier/containers/opendde-epilora-cu128-b200+v1.sqsh
-#SBATCH --container-mounts=/mnt/home/%u:/mnt/home/%u,/mnt/data:/mnt/data
+# NB: no %u here -- pyxis does no substitution in --container-mounts (that's
+# a Slurm --output/--error-only feature), so an unexpanded %u reaches enroot
+# as a literal path and the container fails to start.
+#SBATCH --container-mounts=/mnt/home/sferrier:/mnt/home/sferrier,/mnt/data:/mnt/data
 #SBATCH --no-container-mount-home
 
 set -euo pipefail

@@ -243,3 +243,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 *.log
+
+# Container images built in-place (e.g. models/opendde/hpc/*.sqsh)
+*.sqsh
