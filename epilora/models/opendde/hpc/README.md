@@ -20,8 +20,9 @@ slurm_eval.sh        one job: per-fold + 5-fold ensemble eval_final on the
 1. **Sync the repo** to the cluster (`/mnt/home/$USER/epiLoRA` by default),
    including `epilora/models/opendde/`, the `train.py`/`model.py`/
    `predict.py`/`data.py`/`eval_final.py` changes, and
-   `configs/backbone_opendde.yaml`. The champion dataset + structures must
-   be under `data/` as usual.
+   `configs/backbone_opendde.yaml`. The champion dataset (FASTAs) must be
+   under `data/` as usual; the structures only the train/eval phases read
+   (the precompute is sequence-only and needs no structures).
 
 2. **Build + deploy the container** (from this directory, on the workstation
    with podman + enroot; same recipe as the campaign's b200 image plus
@@ -79,10 +80,12 @@ predictions, comparable against DiscoTope's).
   round-robin, so each shard gets an ~equal sum of L^2 (the trunk's cost
   unit). Change `NSHARDS` / the array size in `slurm_precompute.sh` for a
   different GPU count (the user-space default is 32 concurrent).
-- **Cache location**: the trunk-feature cache is the coords cache dir next to
-  `--structures` (`data/raw/all-structures-extracted_coords_cache/`), i.e.
-  shared storage — that's what makes 32 concurrent shards and instant fold
-  restarts safe. Deleting `opendde_trunk_*.npy` from it forces a recompute.
+- **Cache location**: the trunk-feature cache is the coords cache dir
+  (`data/raw/all-structures-extracted_coords_cache/`), i.e. shared storage --
+  that's what makes 32 concurrent shards and instant fold restarts safe.
+  Both the precompute and train.py default there (the path is derived from
+  train.py's default `--structures`; no structure is read to compute it).
+  Deleting `opendde_trunk_*.npy` from it forces a recompute.
 - **rtxp6000 partition**: use the campaign's baked-driver image recipe
   instead (opendde_coreweave/container/Dockerfile) + pyyaml — the b200 image
   carries no driver libs and will silently fall back to CPU there.

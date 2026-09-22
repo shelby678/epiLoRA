@@ -11,6 +11,10 @@ thing resumable: re-running a shard skips every entry already on disk, so a
 preempted (--requeue) or resubmitted array loses at most the one in-flight
 record.
 
+Needs only the FASTAs -- no structures (the trunk is sequence-only). A few
+records that training will skip anyway (no usable structure, so usable()
+drops them) get cached too; harmless, their entries just go unread.
+
 Load balancing: records are sorted by sequence length (descending) and
 dealt round-robin, so every shard gets an ~equal sum of L^2 -- the trunk's
 cost unit -- instead of whatever lengths happened to cluster in file order.
@@ -30,7 +34,7 @@ EPILORA = Path(__file__).resolve().parents[3]  # epilora/, for flat imports
 if str(EPILORA) not in sys.path:
     sys.path.insert(0, str(EPILORA))
 
-from data import default_cache_dir, load_samples, parse_fasta  # noqa: E402
+from data import default_cache_dir, parse_fasta  # noqa: E402
 
 # train.py's default training set + shared benchmark, plus eval_final.py's
 # held-out set -- everything any fold or the final eval will forward through.
@@ -64,11 +68,11 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo", type=Path, default=EPILORA.parent,
                    help="the epiLoRA checkout (its data/train_test_eval/ is read)")
-    p.add_argument("--structures", type=Path, default=None,
-                   help="structures root (default: <repo>/data/raw/all-structures-extracted)")
     p.add_argument("--emb-cache", type=Path, default=None,
-                   help="trunk-feature cache dir (default: the coords cache next "
-                        "to --structures, matching train.py)")
+                   help="trunk-feature cache dir (default: the coords cache dir "
+                        "train.py's default --structures resolves to, so the array "
+                        "feeds the fold trainings unchanged -- the path is derived, "
+                        "no structure is read)")
     p.add_argument("--shard", type=int, required=True)
     p.add_argument("--nshards", type=int, required=True)
     p.add_argument("--limit", type=int, default=None,
@@ -76,8 +80,11 @@ def main():
     args = p.parse_args()
 
     repo = args.repo
-    structures = args.structures or (repo / "data/raw/all-structures-extracted")
-    emb_cache = args.emb_cache or default_cache_dir(structures)
+    # Same dir train.py's default points its emb_cache at (the coords cache
+    # next to its default --structures); derived for compatibility only --
+    # this script never reads a structure.
+    emb_cache = args.emb_cache or default_cache_dir(
+        repo / "data/raw/all-structures-extracted")
 
     entries = records_for(repo)
     # longest first, ties by header -> deterministic identical assignment in
@@ -88,33 +95,26 @@ def main():
         mine = mine[:args.limit]
     log(f"shard {args.shard}/{args.nshards}: {len(mine)} of {len(entries)} records")
 
-    samples = load_samples(mine, structures)
-    log(f"shard {args.shard}: {len(samples)} with structure "
-        f"({sum(1 for s in samples if s[3] is None)} without)")
-
     import torch
     from models.opendde import build_model_opendde
 
     model = build_model_opendde(device="cuda", emb_cache=emb_cache)
     model.eval()
-    t0, n_cached, n_skip, n_fail = time.time(), 0, 0, 0
-    for i, (header, seq, _, coords, _) in enumerate(samples):
-        if coords is None:
-            n_skip += 1  # unusable in training either way (usable() skips them)
-            continue
+    t0, n_cached, n_fail = time.time(), 0, 0
+    for i, (header, seq, _) in enumerate(mine):
         try:
             model._trunk_features_cached(seq)
             n_cached += 1
-        except Exception as e:  # bad CA, OOM, ... -- training skips these too
+        except Exception as e:  # OOM, ... -- training skips these too
             n_fail += 1
             log(f"  [fail] {header.split()[0]}: {type(e).__name__}: {e}")
             torch.cuda.empty_cache()
         if (i + 1) % 5 == 0:
             el = time.time() - t0
-            eta = el / (i + 1) * (len(samples) - i - 1)
-            log(f"shard {args.shard}: {i + 1}/{len(samples)}  {el / 60:.0f}m elapsed, "
+            eta = el / (i + 1) * (len(mine) - i - 1)
+            log(f"shard {args.shard}: {i + 1}/{len(mine)}  {el / 60:.0f}m elapsed, "
                 f"~{eta / 60:.0f}m left  ({n_cached} cached, {n_fail} failed)")
-    log(f"shard {args.shard} DONE: {n_cached} cached, {n_skip} no-structure, "
+    log(f"shard {args.shard} DONE: {n_cached} cached, "
         f"{n_fail} failed in {(time.time() - t0) / 60:.0f}m -> {emb_cache}")
 
 

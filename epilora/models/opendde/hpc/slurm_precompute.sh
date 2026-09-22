@@ -1,8 +1,9 @@
 #!/bin/bash
 # OpenDDE-backbone benchmark, phase 1 of 3: trunk-feature precompute, sharded
-# across a Slurm array (one GPU per task). Writes the shared embedding cache
-# that the fold trainings and eval_final read; safe to resubmit/requeue
-# (cached entries are skipped). Submitted by submit_all.sh.
+# across a Slurm array (one GPU per task). Sequence-only: needs just the
+# repo's FASTAs, no structures. Writes the shared embedding cache that the
+# fold trainings and eval_final read; safe to resubmit/requeue (cached
+# entries are skipped). Submitted by submit_all.sh.
 #
 # Edit the vars below for your cluster (or the #SBATCH headers directly).
 
@@ -26,11 +27,10 @@
 set -euo pipefail
 
 REPO="${REPO:-/mnt/home/$USER/epiLoRA}"            # the epiLoRA checkout
-STRUCTURES="${STRUCTURES:-$REPO/data/raw/all-structures-extracted}"
 # checkpoint/ + common/ (CCD assets) -- read-only is fine, they are only read
 export OPENDDE_ROOT_DIR="${OPENDDE_ROOT_DIR:-/mnt/data/sferrier/opendde}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 exec python3 "$REPO/epilora/models/opendde/hpc/precompute_shards.py" \
-    --repo "$REPO" --structures "$STRUCTURES" \
+    --repo "$REPO" \
     --shard "${SLURM_ARRAY_TASK_ID}" --nshards "${NSHARDS:-32}"
