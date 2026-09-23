@@ -94,6 +94,39 @@ def build_head(hidden: int, head_dim: int | None, dropout: float) -> nn.Module:
     )
 
 
+class TransformerHead(nn.Module):
+    """Per-residue transformer head: ``blocks`` pre-norm (multi-head
+    self-attention + FFN) blocks over the (L, hidden) backbone features,
+    then a final LayerNorm + Linear(d, 1) -- one logit per residue.
+
+    ``head_dim`` overrides the block width (default: the input width, i.e.
+    the head runs at the backbone's); it must divide evenly by ``heads``.
+    The FFN is ``head_dim * ffn_mult`` wide. Input/output follow the base
+    class's 2D (L, dim) per-protein calling convention.
+    """
+
+    def __init__(self, hidden: int, head_dim: int | None, blocks: int,
+                 heads: int, ffn_mult: int, dropout: float):
+        super().__init__()
+        d = hidden if head_dim is None else head_dim
+        if d % heads:
+            raise ValueError(f"head width {d} is not divisible by {heads} "
+                             "attention heads -- set head_dim accordingly")
+        self.in_proj = nn.Identity() if d == hidden else nn.Linear(hidden, d)
+        self.blocks = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d, nhead=heads,
+                                       dim_feedforward=d * ffn_mult,
+                                       dropout=dropout, activation="gelu",
+                                       batch_first=True, norm_first=True),
+            num_layers=blocks, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(d)
+        self.out = nn.Linear(d, 1)
+
+    def forward(self, x):
+        y = self.blocks(self.in_proj(x.unsqueeze(0)))
+        return self.out(self.norm(y)).squeeze(0)
+
+
 def patch_encoder_rys(encoder, rys_start: int, rys_end: int) -> None:
     """Replay ``encoder.layers[rys_start:rys_end]`` a second time (RYS)."""
     import types
@@ -132,15 +165,23 @@ class EpitopeModel(nn.Module):
     """
 
     def _init_head(self, hidden: int, dropout: float, head_dim: int | None,
-                   extra_feats=()) -> None:
+                   extra_feats=(), head_blocks: int | None = None,
+                   head_heads: int = 4, head_ffn_mult: int = 4) -> None:
         """Build the per-residue head over ``hidden`` backbone dims plus the
-        inputs contributed by ``extra_feats`` (see data.EXTRA_FEATURE_WIDTHS)."""
+        inputs contributed by ``extra_feats`` (see data.EXTRA_FEATURE_WIDTHS).
+        ``head_blocks`` set (>0) builds a TransformerHead of that many
+        attention+FFN blocks instead of the Linear/MLP head."""
         self.hidden = hidden
         self.extra_feats = tuple(extra_feats)
         self.n_extra_feats = extra_feats_width(self.extra_feats)  # also validates names
         self.head_ln = nn.LayerNorm(hidden)
         self.head_drop = nn.Dropout(dropout)
-        self.head = build_head(hidden + self.n_extra_feats, head_dim, dropout)
+        in_dim = hidden + self.n_extra_feats
+        if head_blocks:
+            self.head = TransformerHead(in_dim, head_dim, head_blocks,
+                                        head_heads, head_ffn_mult, dropout)
+        else:
+            self.head = build_head(in_dim, head_dim, dropout)
 
     @property
     def device(self):

@@ -99,6 +99,13 @@ class TrainConfig:
     rys_start: int = 4                 # replay window start
     rys_end: int = 8                   # replay window end, exclusive; rys_end<=rys_start disables RYS
     head_dim: Optional[int] = None     # if set, MLP head Linear(hidden,head_dim)-GELU-Linear(.,1)
+    # Transformer head (opendde only so far): when head_blocks is set, the
+    # head is N pre-norm (multi-head self-attention + FFN) blocks over the
+    # per-residue backbone features instead of the Linear/MLP head above;
+    # head_dim then overrides the block width (None = the backbone width)
+    head_blocks: Optional[int] = None
+    head_heads: int = 4               # attention heads per block
+    head_ffn_mult: int = 4            # FFN width as a multiple of the block width
     dropout: float = 0.1               # dropout applied in the head (and MLP hidden layer, if used)
     # Extra per-residue head inputs (e.g. ["rsa", "length"]); see
     # data.EXTRA_FEATURE_NAMES. Empty = the champion head.
@@ -393,6 +400,13 @@ def main() -> None:
         p.error(f"extra_feats={cfg.extra_feats} is only wired for backbone=esmif1 "
                 f"or opendde, not {cfg.backbone!r}")
 
+    if cfg.head_blocks is not None:
+        if cfg.backbone != "opendde":
+            p.error(f"head_blocks={cfg.head_blocks} is only wired for "
+                    f"backbone=opendde, not {cfg.backbone!r}")
+        if cfg.head_blocks < 1:
+            p.error(f"head_blocks must be >= 1, got {cfg.head_blocks}")
+
     loss_weights = None
     surface_fasta = None
     if cfg.loss_mask is not None:
@@ -453,17 +467,21 @@ def main() -> None:
     elif cfg.backbone == "opendde":
         # Frozen OpenDDE Pairformer trunk (ab_ag) + head; must run under the
         # opendde env (machine_config.yaml's env_opendde), not fair-esm's.
-        # Sequence-only. head_dim: the opendde recipe's default is an MLP head
-        # (128) when the config doesn't set one. emb_cache: the trunk is
-        # frozen and slow, so its per-sample features are cached next to the
-        # structures like the coords/RSA caches are.
+        # Sequence-only. head_dim: the MLP recipe's default is an MLP head
+        # (128) when the config doesn't set one; the transformer head
+        # (head_blocks) defaults to the trunk width instead (head_dim=None).
+        # emb_cache: the trunk is frozen and slow, so its per-sample features
+        # are cached next to the structures like the coords/RSA caches are.
         from model import build_model_opendde
         from data import default_cache_dir
         model = build_model_opendde(device=DEVICE, checkpoint=cfg.opendde_checkpoint,
                                      cycles=cfg.opendde_cycles, dropout=cfg.dropout,
-                                     head_dim=(cfg.head_dim if cfg.head_dim is not None else 128),
+                                     head_dim=(cfg.head_dim if (cfg.head_dim is not None
+                                                                or cfg.head_blocks) else 128),
                                      extra_feats=cfg.extra_feats,
-                                     emb_cache=default_cache_dir(args.structures))
+                                     emb_cache=default_cache_dir(args.structures),
+                                     head_blocks=cfg.head_blocks, head_heads=cfg.head_heads,
+                                     head_ffn_mult=cfg.head_ffn_mult)
     elif cfg.backbone in ("prostt5", "prott5"):
         # Both are the same frozen-T5-encoder wrapper; only the pretrained
         # weights differ (see model.PROTT5_NAMES).

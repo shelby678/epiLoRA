@@ -270,24 +270,32 @@ class OpenDDEPairformerEpitopeModel(EpitopeModel):
     ``emb_cache`` (optional) is a directory the frozen trunk's per-sequence
     features are cached in (see the module docstring); it is runtime-only
     state, deliberately not part of config()/checkpoints. The head itself is
-    the same MLP head every other epiLoRA backbone uses
-    (model.EpitopeModel._init_head), so extra_feats work here too.
+    the same head every other epiLoRA backbone uses
+    (model.EpitopeModel._init_head), so extra_feats work here too --
+    including the transformer head (``head_blocks`` > 0: N pre-norm
+    attention+FFN blocks over the per-residue trunk features, defaulting to
+    the trunk width when ``head_dim`` is None).
     """
 
     def __init__(self, trunk, cycles: int = 10, dropout: float = 0.1,
                  head_dim: int | None = 128, extra_feats=(),
-                 checkpoint=None, emb_cache=None):
+                 checkpoint=None, emb_cache=None, head_blocks: int | None = None,
+                 head_heads: int = 4, head_ffn_mult: int = 4):
         super().__init__()
         self.opendde = trunk
         self.cycles = int(cycles)
         self._cfg = dict(cycles=self.cycles, dropout=dropout, head_dim=head_dim,
                          extra_feats=list(extra_feats),
-                         checkpoint=None if checkpoint is None else str(checkpoint))
+                         checkpoint=None if checkpoint is None else str(checkpoint),
+                         head_blocks=head_blocks, head_heads=head_heads,
+                         head_ffn_mult=head_ffn_mult)
         self._emb_cache = Path(emb_cache) if emb_cache is not None else None
         for p in self.opendde.parameters():
             p.requires_grad = False
         # Trunk width read off the loaded model (configs.c_s), not hardcoded.
-        self._init_head(int(trunk.c_s), dropout, head_dim, extra_feats)
+        self._init_head(int(trunk.c_s), dropout, head_dim, extra_feats,
+                        head_blocks=head_blocks, head_heads=head_heads,
+                        head_ffn_mult=head_ffn_mult)
 
     def _emb_cache_path(self, seq: str) -> Path | None:
         """Cache file for this sample's trunk features (see trunk_cache_path)."""
@@ -338,17 +346,22 @@ class OpenDDEPairformerEpitopeModel(EpitopeModel):
 
 def build_model_opendde(device: str = "cpu", checkpoint=None, cycles: int = 10,
                         dropout: float = 0.1, head_dim: int | None = 128,
-                        extra_feats=(), emb_cache=None) -> "OpenDDEPairformerEpitopeModel":
+                        extra_feats=(), emb_cache=None, head_blocks: int | None = None,
+                        head_heads: int = 4, head_ffn_mult: int = 4
+                        ) -> "OpenDDEPairformerEpitopeModel":
     """Build an (untrained) OpenDDE-trunk epiLoRA model on ``device``.
 
     ``head_dim`` defaults to 128 (an MLP head), unlike the esmif1 champion's
-    direct Linear -- that is this backbone's default recipe. Sequence-only:
-    no structure is read anywhere.
+    direct Linear -- that is this backbone's default recipe; with
+    ``head_blocks`` set it instead means the transformer head's block width
+    (None = the trunk width). Sequence-only: no structure is read anywhere.
     """
     ckpt = resolve_opendde_checkpoint(checkpoint)
     trunk = load_base_opendde(ckpt, device=device)
     model = OpenDDEPairformerEpitopeModel(trunk, cycles=cycles, dropout=dropout,
                                           head_dim=head_dim, extra_feats=extra_feats,
                                           checkpoint=ckpt,
-                                          emb_cache=emb_cache).to(device)
+                                          emb_cache=emb_cache, head_blocks=head_blocks,
+                                          head_heads=head_heads,
+                                          head_ffn_mult=head_ffn_mult).to(device)
     return model
