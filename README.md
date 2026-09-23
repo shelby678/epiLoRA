@@ -176,3 +176,17 @@ prep time, so no opendde training antigen near-duplicates a held-out
 epitope. Run the four rows x five folds with
 `ablation/ablation_list_opendde*.csv`; results land in
 `ablation/results_opendde*.csv`.
+
+The opendde **backbone** itself (frozen ab_ag Pairformer trunk + MLP head,
+`epilora/models/opendde/`) is submitted the same way as every other model: a
+sweep row with `model` set to `opendde` (first row of
+`ablation/ablation_list_opendde.csv`). Its jobs run under
+`machine_config.yaml`'s `env_opendde` and read the trunk checkpoint + CCD
+assets from `opendde_root`. `run_ablation.py` preflights every row before
+scheduling it — training env, opendde assets, dataset, soft-label/surface
+companions — and skips rows with something missing, since a Slurm job can
+wait hours for a node and then die in its first seconds on a missing input.
+Warm the shared trunk-feature cache first with
+`epilora/models/opendde/precompute_shards.py` (sharded over as many GPUs as
+you can get): the trunk pass is ~1 min/antigen, beyond a fold job's time
+budget on a cold cache.

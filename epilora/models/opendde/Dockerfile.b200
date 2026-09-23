@@ -1,6 +1,25 @@
 # =============================================================================
 # epiLoRA OpenDDE-backbone image for the b200 partition.
 #
+# Only needed when the opendde sweep's jobs run inside a container that must
+# carry the opendde package itself. The simpler option is a plain venv with
+# `opendde[gpu]` + pyyaml on storage shared with the compute nodes, pointed
+# at by machine_config.yaml's env_opendde (same convention as env/env_esm3) --
+# run_ablation.py preflights that path, so it must resolve on the submission
+# host too, which a venv on shared storage does and this image's /opt/opendde
+# (container-internal) does not. To run the sweep against this image instead,
+# override the per-job script's container, e.g.:
+#   python run_ablation.py --slurm --list ablation_list_opendde.csv \
+#       --slurm-args "--partition=b200 --mem=48G \
+#                     --container-image=/mnt/data/sferrier/containers/opendde-epilora-cu128-b200+v1.sqsh"
+# (with env_opendde still pointing at a submission-host-visible python that
+# works inside that container).
+#
+# Build + deploy (podman + enroot, from this directory):
+#   podman build -t opendde-epilora:cu128-b200 -f Dockerfile.b200 .
+#   enroot import -o opendde-epilora-cu128-b200+v1.sqsh podman://opendde-epilora:cu128-b200
+#   scp opendde-epilora-cu128-b200+v1.sqsh <cluster>:/mnt/data/sferrier/containers/
+#
 # Same recipe as opendde_coreweave/container/Dockerfile.b200 (the campaign
 # image -- see that repo's container/README.md for the driver story: b200
 # nodes run a real host driver that pyxis/enroot injects at runtime, so NO

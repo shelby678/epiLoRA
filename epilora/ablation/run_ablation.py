@@ -12,8 +12,10 @@ a CSV with columns ``name,dataset,model,config`` (``config`` optional):
     rys_none_mr5     min_resolution_5_epitopes.fasta  esmif1     rys_none.yaml
 
 - ``dataset`` is a filename in ``--tte-dir``.
-- ``model`` is ``esmif1``, ``esm3``, or ``<esm2|esmc>_<size>`` (e.g. ``esm2_650M``);
-  the matching ``configs/backbone_<model>.yaml`` is generated on first use.
+- ``model`` is ``esmif1``, ``opendde``, ``esm3``, or ``<esm2|esmc>_<size>``
+  (e.g. ``esm2_650M``); the matching ``configs/backbone_<model>.yaml`` is
+  generated on first use. ``model`` picks the training env (machine_config.yaml:
+  ``env``, ``env_opendde``, or ``env_esm3``).
 - ``config`` (empty = derived from ``model``) points at a named recipe ablation
   under ``epilora/configs/`` (or an absolute path) for rows that vary a training
   axis ``model`` can't express -- extra head features, RYS off, ... (see
@@ -45,6 +47,14 @@ ablation/slurm_job.sh``) instead of running locally across this machine's
 GPUs -- use when the GPUs live on a separate cluster/machine. Results/weights
 land wherever your ``.env``'s ``sync_job_dir()`` ships them; aggregate with
 ``--summarize-only`` once they've synced back.
+
+Before anything is scheduled, every sweep row is preflighted: the files its
+jobs read must exist here -- the training env's python (with ``--slurm``),
+the opendde trunk checkpoint + CCD assets for opendde rows, and the
+soft-label/surface companion files of the dataset. A row with something
+missing is skipped with the paths printed rather than submitted: a Slurm
+job can wait hours for a node and then die in its first seconds on a missing
+input, so catch that here instead.
 """
 from __future__ import annotations
 
@@ -82,13 +92,30 @@ _MODEL_RE = re.compile(r"^(?P<backbone>esm2|esmc)_(?P<size>\w+)$")
 
 # Machine-specific env locations -- edit epilora/machine_config.yaml, not this.
 _machine_cfg = yaml.safe_load((EPILORA_DIR / "machine_config.yaml").read_text())
-ENV_PYTHON = (EPILORA_DIR / _machine_cfg["env"]).resolve() / "bin" / "python3"
-ENV_ESM3_PYTHON = (EPILORA_DIR / _machine_cfg["env_esm3"]).resolve() / "bin" / "python3"
+
+
+def env_key_for(model: str) -> str:
+    """The machine_config.yaml key holding the env this model trains under:
+    opendde's package needs python >= 3.11 / torch 2.7 (env_opendde), and
+    EvolutionaryScale's esm collides with fair-esm's by import name
+    (env_esm3); everything else trains in the fair-esm env."""
+    if model == "opendde":
+        return "env_opendde"
+    if model == "esm3" or model.startswith("esmc"):
+        return "env_esm3"
+    return "env"
+
+
+def env_python_for(model: str) -> Path | None:
+    """The env python this model's jobs run under, per machine_config.yaml
+    (None = that machine hasn't configured the entry)."""
+    env_dir = _machine_cfg.get(env_key_for(model))
+    return (EPILORA_DIR / env_dir).resolve() / "bin" / "python3" if env_dir else None
 
 
 def train_python_for(model: str) -> str:
-    env_python = ENV_ESM3_PYTHON if (model == "esm3" or model.startswith("esmc")) else ENV_PYTHON
-    return str(env_python) if env_python.exists() else sys.executable
+    env_python = env_python_for(model)
+    return str(env_python) if env_python is not None and env_python.exists() else sys.executable
 
 
 def config_for_model(model: str) -> Path | None:
@@ -100,13 +127,15 @@ def config_for_model(model: str) -> Path | None:
     """
     if model == "esmif1":
         return None
-    if model == "esm3":
+    if model == "opendde":
+        cfg = {"backbone": "opendde"}
+    elif model == "esm3":
         cfg = {"backbone": "esm3"}
     else:
         m = _MODEL_RE.match(model)
         if not m:
             raise ValueError(f"unrecognized model {model!r} "
-                              "(expected esmif1, esm3, esm2_<size>, or esmc_<size>; "
+                              "(expected esmif1, opendde, esm3, esm2_<size>, or esmc_<size>; "
                               "for other backbones or recipe ablations, set the row's "
                               "config column to a configs/*.yaml)")
         cfg = {"backbone": m["backbone"], f"{m['backbone']}_size": m["size"]}
@@ -136,6 +165,84 @@ def config_for_row(row: dict) -> Path | None:
     if explicit is not None:
         return explicit
     return config_for_model(row["model"])
+
+
+def row_config(row: dict) -> dict:
+    """The row's explicit `config` yaml as a dict ({} when the column is
+    empty) -- the recipe axes a row can vary that `model` can't express."""
+    cfg_path = row_config_path(row)
+    if cfg_path is None:
+        return {}
+    return yaml.safe_load(cfg_path.read_text()) or {}
+
+
+# The CCD files the opendde featurizer reads, under the same "opendde root"
+# as the trunk checkpoint (see models/opendde/model.py).
+OPENDDE_CCD_ASSETS = ("common/components.cif", "common/components.cif.rdkit_mol.pkl")
+
+
+def opendde_root() -> Path:
+    """Same resolution as models/opendde/model.py's resolve_opendde_root:
+    $OPENDDE_ROOT_DIR, else machine_config.yaml's opendde_root, else
+    opendde's own default (~/.cache/opendde)."""
+    env = os.environ.get("OPENDDE_ROOT_DIR")
+    if env:
+        return Path(env)
+    root = _machine_cfg.get("opendde_root")
+    if root:
+        path = Path(root)
+        return path if path.is_absolute() else EPILORA_DIR / path
+    return Path.home() / ".cache" / "opendde"
+
+
+def missing_job_files(row: dict, args, check_env: bool) -> list[str]:
+    """What this row's jobs read that isn't on disk ([] = good to go), as
+    printable one-liners. A row with problems is skipped instead of run: a
+    Slurm job can wait hours for a node and then die in its first seconds on
+    a missing input, so catch that before submitting, not on the node.
+
+    ``check_env``: also require the model's training-env python to exist.
+    Always set for --slurm (the job runs $TRAIN_PYTHON verbatim on its node,
+    no fallback possible); locally train_python_for() falls back to
+    sys.executable, so a missing env there isn't necessarily fatal and the
+    check is skipped."""
+    missing: list[str] = []
+    model = row["model"]
+
+    if check_env:
+        env_python = env_python_for(model)
+        if env_python is None:
+            missing.append(f"machine_config.yaml has no {env_key_for(model)} entry "
+                           f"(the env model {model!r} trains under)")
+        elif not env_python.exists():
+            missing.append(f"{env_python} ({env_key_for(model)}, the env model "
+                           f"{model!r} trains under -- fix machine_config.yaml)")
+
+    cfg = row_config(row)
+    if model == "opendde" or cfg.get("backbone") == "opendde":
+        # Trunk checkpoint (the config may override its path) + CCD assets.
+        checkpoint = (Path(cfg["opendde_checkpoint"])
+                      if cfg.get("opendde_checkpoint") else None)
+        assets = [checkpoint or opendde_root() / "checkpoint" / "opendde_abag.pt",
+                  *(opendde_root() / a for a in OPENDDE_CCD_ASSETS)]
+        missing += [f"{p} (opendde trunk asset; see OPENDDE_ROOT_DIR / "
+                    f"machine_config.yaml's opendde_root)" for p in assets if not p.exists()]
+
+    fasta = args.tte_dir / row["dataset"]
+    # labels=soft records take their targets from a companion tsv that
+    # train.py hard-errors without (see data.py); the surface loss mask
+    # likewise needs its companion fasta (see make_surface_fasta.py).
+    if any("labels=soft" in line.split() for line in fasta.read_text().splitlines()
+           if line.startswith(">")):
+        companion = fasta.with_name(f"{fasta.stem}_soft_labels.tsv")
+        if not companion.exists():
+            missing.append(f"{companion} (soft-label companion of {row['dataset']})")
+    if cfg.get("loss_mask") == "surface":
+        surface = fasta.with_name(f"{fasta.stem}_surface.fasta")
+        if not surface.exists():
+            missing.append(f"{surface} (surface-mask companion of {row['dataset']}; "
+                           f"generate it with make_surface_fasta.py --fasta {fasta})")
+    return missing
 
 
 def discover_datasets(tte_dir: Path) -> list[Path]:
@@ -410,6 +517,27 @@ def main() -> None:
     if bad_cfgs:
         p.error(f"config(s) referenced in {args.list} not found (relative names resolve "
                 f"under {CONFIGS_DIR}): {bad_cfgs}")
+
+    if not args.structures.is_dir():
+        p.error(f"--structures not found: {args.structures}")
+
+    # Preflight every row (see missing_job_files): a row whose jobs would die
+    # on a missing input is skipped here, before any queue wait is paid.
+    skipped = {}
+    for row in rows:
+        problems = missing_job_files(row, args, check_env=args.slurm)
+        if problems:
+            skipped.setdefault(row["name"], []).extend(problems)
+    if skipped:
+        print(f"skipping {len(skipped)} sweep row(s) -- missing files (fix or sync them, then rerun):",
+              flush=True)
+        for name, problems in skipped.items():
+            for problem in problems:
+                print(f"  {name}: {problem}", flush=True)
+        keep = set(skipped)
+        rows = [r for r in rows if r["name"] not in keep]
+    if not rows:
+        p.error("no runnable sweep rows (empty list, or every row failed the preflight -- see above)")
 
     jobs = [(row, f) for row in rows for f in args.folds]
 

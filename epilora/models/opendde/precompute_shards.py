@@ -1,4 +1,4 @@
-"""Shard the OpenDDE trunk-feature precompute across Slurm array tasks.
+"""Shard the OpenDDE trunk-feature precompute across parallel tasks.
 
     python precompute_shards.py --shard $SLURM_ARRAY_TASK_ID --nshards 32
 
@@ -11,6 +11,14 @@ thing resumable: re-running a shard skips every entry already on disk, so a
 preempted (--requeue) or resubmitted array loses at most the one in-flight
 record.
 
+Run this (sharded over as many GPUs as you can get -- e.g. via your own
+`sbatch --array` wrapper) *before* submitting an opendde sweep with
+run_ablation.py: the fold jobs read the same cache, and on a cold one each
+of them recomputes the ~1 min/antigen trunk pass itself, which no single
+fold's time budget covers. The trunk-feature cache is the coords cache dir
+next to data/raw/all-structures-extracted (shared storage), so shards warmed
+from any node feed every fold.
+
 Needs only the FASTAs -- no structures (the trunk is sequence-only). A few
 records that training will skip anyway (no usable structure, so usable()
 drops them) get cached too; harmless, their entries just go unread.
@@ -19,8 +27,8 @@ Load balancing: records are sorted by sequence length (descending) and
 dealt round-robin, so every shard gets an ~equal sum of L^2 -- the trunk's
 cost unit -- instead of whatever lengths happened to cluster in file order.
 
-Must run under the opendde env (see models/opendde/ and the hpc/ README);
-set OPENDDE_ROOT_DIR (checkpoint/ + common/) unless machine_config.yaml's
+Must run under the opendde env (machine_config.yaml's env_opendde); set
+OPENDDE_ROOT_DIR (checkpoint/ + common/) unless machine_config.yaml's
 opendde_root already resolves on this machine.
 """
 from __future__ import annotations
@@ -30,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-EPILORA = Path(__file__).resolve().parents[3]  # epilora/, for flat imports
+EPILORA = Path(__file__).resolve().parents[2]  # epilora/, for flat imports
 if str(EPILORA) not in sys.path:
     sys.path.insert(0, str(EPILORA))
 

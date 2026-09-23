@@ -65,6 +65,10 @@ if [[ "${WANDB:-0}" == "1" ]]; then
 fi
 
 # train
+# expandable_segments: the opendde trunk's O(L^2) pair tensors fragment the
+# caching allocator on long antigens without it (harmless for every other
+# backbone)
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 "$TRAIN_PYTHON" "$TRAIN_PY" \
     --fasta "$FASTA" --structures "$STRUCTURES" \
     --fold "$FOLD" --out "$JOB_WORK_DIR/$OUT_NAME" \
