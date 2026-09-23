@@ -30,6 +30,11 @@ cost unit -- instead of whatever lengths happened to cluster in file order.
 Must run under the opendde env (machine_config.yaml's env_opendde); set
 OPENDDE_ROOT_DIR (checkpoint/ + common/) unless machine_config.yaml's
 opendde_root already resolves on this machine.
+
+``--dry-run`` reports cache warmth instead of computing anything (no GPU, no
+checkpoint load): per shard, how many of its records are already cached vs
+missing -- with the missing ones' sum of L^2, the trunk's cost unit -- plus a
+total. Omit ``--shard`` to report every shard at once.
 """
 from __future__ import annotations
 
@@ -53,6 +58,10 @@ FASTAS = [
     "data/train_test_eval/eval/allowed_species_homo_sapiens_min_resolution_5_epitopes.fasta",
 ]
 
+# Recycling cycles the trunk runs (and so the cache is keyed) with -- must
+# match build_model_opendde's default, which the compute path below uses.
+CYCLES = 10
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -71,6 +80,43 @@ def records_for(repo: Path):
     return entries
 
 
+def dry_run(entries: list, args, emb_cache: Path, chunk_size: int) -> None:
+    """Report cached vs missing records per shard, computing nothing (the
+    cache keys come from models.opendde.trunk_cache_path, the same function
+    the model's own cache reads go through)."""
+    from models.opendde import trunk_cache_path
+
+    shards = [args.shard] if args.shard is not None else range(args.nshards)
+    log(f"dry run: {len(entries)} records, {args.nshards} shards, cache: {emb_cache}")
+    tot_cached = tot_missing = tot_l2 = 0
+    for shard in shards:
+        mine = entries[shard::args.nshards]
+        if args.limit is not None:
+            mine = mine[:args.limit]
+        missing_l2 = 0
+        n_cached = 0
+        for _, seq, _ in mine:
+            path = trunk_cache_path(emb_cache, seq, cycles=CYCLES,
+                                    chunk_size=chunk_size)
+            if path.exists():
+                n_cached += 1
+            else:
+                missing_l2 += len(seq) ** 2
+        n_missing = len(mine) - n_cached
+        tot_cached += n_cached
+        tot_missing += n_missing
+        tot_l2 += missing_l2
+        extra = f" (missing sum L^2 = {missing_l2:,})" if n_missing else ""
+        log(f"shard {shard}/{args.nshards}: {n_cached} cached, "
+            f"{n_missing} missing{extra}")
+    if args.shard is None:
+        log(f"TOTAL: {tot_cached} cached, {tot_missing} missing "
+            f"(missing sum L^2 = {tot_l2:,}) -> cache is "
+            f"{'warm' if tot_missing == 0 else 'COLD'}; run without --dry-run "
+            f"to compute the missing ones")
+
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -81,11 +127,19 @@ def main():
                         "train.py's default --structures resolves to, so the array "
                         "feeds the fold trainings unchanged -- the path is derived, "
                         "no structure is read)")
-    p.add_argument("--shard", type=int, required=True)
+    p.add_argument("--shard", type=int, default=None,
+                   help="which shard to compute (required without --dry-run; with it, "
+                        "the only shard reported)")
     p.add_argument("--nshards", type=int, required=True)
     p.add_argument("--limit", type=int, default=None,
                    help="process only the first N records of this shard (testing)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report cached vs missing records per shard without computing "
+                        "anything (no GPU, no checkpoint load)")
     args = p.parse_args()
+
+    if args.shard is None and not args.dry_run:
+        p.error("--shard is required (or pass --dry-run to just report cache warmth)")
 
     repo = args.repo
     # Same dir train.py's default points its emb_cache at (the coords cache
@@ -98,6 +152,12 @@ def main():
     # longest first, ties by header -> deterministic identical assignment in
     # every task, and every shard's sum of L^2 (the trunk's cost unit) ~equal.
     entries.sort(key=lambda e: (-len(e[1]), e[0]))
+
+    if args.dry_run:
+        from models.opendde import trunk_chunk_size
+        dry_run(entries, args, emb_cache, trunk_chunk_size())
+        return
+
     mine = entries[args.shard::args.nshards]
     if args.limit is not None:
         mine = mine[:args.limit]
@@ -106,7 +166,7 @@ def main():
     import torch
     from models.opendde import build_model_opendde
 
-    model = build_model_opendde(device="cuda", emb_cache=emb_cache)
+    model = build_model_opendde(device="cuda", cycles=CYCLES, emb_cache=emb_cache)
     model.eval()
     t0, n_cached, n_fail = time.time(), 0, 0
     for i, (header, seq, _) in enumerate(mine):

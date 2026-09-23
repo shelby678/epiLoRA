@@ -111,6 +111,33 @@ def resolve_opendde_checkpoint(checkpoint=None) -> Path:
     return resolve_opendde_root() / "checkpoint" / DEFAULT_CHECKPOINT_NAME
 
 
+def trunk_chunk_size() -> int:
+    """``infer_setting.chunk_size`` exactly as the model build resolves it
+    (it feeds the trunk-feature cache key) -- without loading any weights:
+    apply_runtime_compatibility never touches it (it resolves dtype /
+    triangle kernels) and neither does OpenDDE.__init__."""
+    os.environ.setdefault("OPENDDE_ROOT_DIR", str(resolve_opendde_root()))
+    from opendde.config.inference import build_inference_config  # lazy: fair-esm-safe
+
+    return build_inference_config().infer_setting.chunk_size
+
+
+def trunk_cache_path(emb_cache, seq: str, cycles: int, chunk_size: int,
+                     checkpoint=None) -> Path:
+    """The trunk-feature cache file for ``seq`` under ``emb_cache`` -- the
+    single source of the (checkpoint, cycles, chunk size, sequence) key,
+    shared by OpenDDEPairformerEpitopeModel's cache reads/writes and by tools
+    that inspect the cache without a model (precompute_shards.py --dry-run).
+    The key format deliberately differs from the confidence-lane era's (which
+    also hashed the CA geometry and a use_pair flag), so files written by
+    those builds can never be silently reused."""
+    ckpt = Path(checkpoint or DEFAULT_CHECKPOINT_NAME)
+    key = hashlib.sha1(
+        f"seqonly|{ckpt.stem}|{cycles}|{chunk_size}|{seq}"
+        .encode()).hexdigest()
+    return Path(emb_cache) / f"opendde_trunk_{key}.npy"
+
+
 def load_base_opendde(checkpoint=None, device: str = "cpu"):
     """Load the frozen OpenDDE Pairformer trunk from the ab_ag checkpoint.
 
@@ -263,19 +290,12 @@ class OpenDDEPairformerEpitopeModel(EpitopeModel):
         self._init_head(int(trunk.c_s), dropout, head_dim, extra_feats)
 
     def _emb_cache_path(self, seq: str) -> Path | None:
-        """Cache file for this sample's trunk features -- keyed by (checkpoint,
-        cycles, chunk size, sequence). The key format deliberately differs
-        from the confidence-lane era's (which also hashed the CA geometry and
-        a use_pair flag), so files written by those builds can never be
-        silently reused here."""
+        """Cache file for this sample's trunk features (see trunk_cache_path)."""
         if self._emb_cache is None:
             return None
-        ckpt = self._cfg.get("checkpoint") or DEFAULT_CHECKPOINT_NAME
-        chunk = self.opendde.configs.infer_setting.chunk_size
-        key = hashlib.sha1(
-            f"seqonly|{Path(ckpt).stem}|{self.cycles}|{chunk}|{seq}"
-            .encode()).hexdigest()
-        return self._emb_cache / f"opendde_trunk_{key}.npy"
+        return trunk_cache_path(self._emb_cache, seq, cycles=self.cycles,
+                                chunk_size=self.opendde.configs.infer_setting.chunk_size,
+                                checkpoint=self._cfg.get("checkpoint"))
 
     def _trunk_features_cached(self, seq: str) -> torch.Tensor:
         """(len(seq), head input width) trunk features, cached if a cache dir
