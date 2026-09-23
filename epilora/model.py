@@ -652,14 +652,20 @@ def load_base_opendde(checkpoint=None, device: str = "cpu"):
 
 def build_model_opendde(device: str = "cpu", checkpoint=None, cycles: int = 10,
                 dropout: float = 0.1, head_dim: int | None = 128,
-                extra_feats=(), emb_cache=None) -> "OpenDDEPairformerEpitopeModel":
+                extra_feats=(), emb_cache=None, head_blocks: int | None = None,
+                head_heads: int = 4, head_ffn_mult: int = 4
+                ) -> "OpenDDEPairformerEpitopeModel":
     """Build an (untrained) OpenDDE-trunk epiLoRA model on ``device``.
 
     ``head_dim`` defaults to 128 (an MLP head), unlike the esmif1 champion's
-    direct Linear; ``emb_cache`` optionally caches the frozen trunk's
-    per-sample features (train.py passes the coords cache dir).
+    direct Linear; with ``head_blocks`` set it instead means the transformer
+    head's block width (None = the trunk width). ``emb_cache`` optionally
+    caches the frozen trunk's per-sample features (train.py passes the coords
+    cache dir).
     """
     from models.opendde import build_model_opendde
     return build_model_opendde(device=device, checkpoint=checkpoint, cycles=cycles,
                                dropout=dropout, head_dim=head_dim,
-                               extra_feats=extra_feats, emb_cache=emb_cache)
+                               extra_feats=extra_feats, emb_cache=emb_cache,
+                               head_blocks=head_blocks, head_heads=head_heads,
+                               head_ffn_mult=head_ffn_mult)
